@@ -1,0 +1,84 @@
+{
+  "profiles": {
+    "desktop": {
+      "name": "Parakeet TDT 0.6B v3 (int8)",
+      "description": "Best accuracy, 25 European languages. ~639 MB download, ~2 GB RAM.",
+      "params": "600M",
+      "size_mb": 639,
+      "streaming": false,
+      "feature_dim": 128,
+      "model_type": "nemo_transducer",
+      "decoder_type": "transducer",
+      "files": {
+        "encoder": {
+          "filename": "encoder.int8.onnx",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/main/encoder.int8.onnx"
+        },
+        "decoder": {
+          "filename": "decoder.int8.onnx",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/main/decoder.int8.onnx"
+        },
+        "joiner": {
+          "filename": "joiner.int8.onnx",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/main/joiner.int8.onnx"
+        },
+        "tokens": {
+          "filename": "tokens.txt",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/main/tokens.txt"
+        }
+      }
+    },
+    "laptop": {
+      "name": "Canary 180M Flash (int8)",
+      "description": "Lightweight, 4 languages (EN/ES/DE/FR). ~198 MB download, ~500 MB RAM.",
+      "params": "180M",
+      "size_mb": 198,
+      "streaming": false,
+      "feature_dim": 128,
+      "model_type": "nemo_ctc",
+      "decoder_type": "ctc",
+      "files": {
+        "model": {
+          "filename": "model.int8.onnx",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8/resolve/main/model.int8.onnx"
+        },
+        "tokens": {
+          "filename": "tokens.txt",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8/resolve/main/tokens.txt"
+        }
+      }
+    },
+    "streaming": {
+      "name": "Nemotron Streaming 0.6B (int8)",
+      "description": "True real-time streaming, English only. ~631 MB download, ~2 GB RAM.",
+      "params": "600M",
+      "size_mb": 631,
+      "streaming": true,
+      "feature_dim": 128,
+      "model_type": "nemo_transducer",
+      "decoder_type": "transducer",
+      "files": {
+        "encoder": {
+          "filename": "encoder.int8.onnx",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemotron-speech-streaming-en-0.6b-int8-2026-01-14/resolve/main/encoder.int8.onnx"
+        },
+        "decoder": {
+          "filename": "decoder.int8.onnx",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemotron-speech-streaming-en-0.6b-int8-2026-01-14/resolve/main/decoder.int8.onnx"
+        },
+        "joiner": {
+          "filename": "joiner.int8.onnx",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemotron-speech-streaming-en-0.6b-int8-2026-01-14/resolve/main/joiner.int8.onnx"
+        },
+        "tokens": {
+          "filename": "tokens.txt",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemotron-speech-streaming-en-0.6b-int8-2026-01-14/resolve/main/tokens.txt"
+        }
+      }
+    }
+  },
+  "vad": {
+    "filename": "silero_vad.onnx",
+    "url": "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx"
+  }
+}
