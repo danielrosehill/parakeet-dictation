@@ -1,14 +1,14 @@
 #!/bin/bash
 # Post-install script to set up Python dependencies in a venv.
 # Run as root after installing the .deb package:
-#   sudo /opt/local-dictation/setup-pip-deps.sh
+#   sudo /opt/parakeet-dictation/setup-pip-deps.sh
 
 set -e
 
-INSTALL_DIR="/opt/local-dictation"
+INSTALL_DIR="/opt/parakeet-dictation"
 VENV_DIR="$INSTALL_DIR/.venv"
 
-echo "Setting up Local Dictation Python environment..."
+echo "Setting up Parakeet Dictation Python environment..."
 
 # Create venv with access to system packages (for PyGObject/gi)
 if [ ! -d "$VENV_DIR" ]; then
@@ -23,5 +23,5 @@ fi
 chmod -R a+rX "$VENV_DIR"
 
 echo ""
-echo "Setup complete. Run 'local-dictation' to start the app."
+echo "Setup complete. Run 'parakeet-dictation' to start the app."
 echo "On first use, download a model from Settings → Models tab."

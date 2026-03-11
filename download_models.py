@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download model files for Local Dictation.
+"""Download model files for Parakeet Dictation.
 
 Usage:
     python download_models.py              # download default (desktop) profile + VAD

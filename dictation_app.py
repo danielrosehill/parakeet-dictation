@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local Dictation — On-device voice typing with punctuation via sherpa-onnx.
+"""Parakeet Dictation — On-device voice typing with punctuation via sherpa-onnx.
 
 Supports multiple ASR model profiles (Parakeet, Canary, Nemotron) with
 configurable hotkeys and VAD-segmented or true streaming transcription.
@@ -27,8 +27,8 @@ from gi.repository import AyatanaAppIndicator3, GLib, Gtk, Gdk
 # Paths & constants
 # ---------------------------------------------------------------------------
 
-APP_NAME = "Local Dictation"
-APP_ID = "local-dictation"
+APP_NAME = "Parakeet Dictation"
+APP_ID = "parakeet-dictation"
 CONFIG_DIR = Path.home() / ".config" / APP_ID
 CONFIG_FILE = CONFIG_DIR / "config.json"
 APP_DIR = Path(__file__).resolve().parent
