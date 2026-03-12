@@ -1750,7 +1750,7 @@ class TrayIcon:
         cfg = self._controller.config
 
         show_window_item = Gtk.MenuItem(label="Show Window")
-        show_window_item.connect("activate", lambda _: self._main_window.present())
+        show_window_item.connect("activate", lambda _: (self._main_window.show_all(), self._main_window.present()))
         menu.append(show_window_item)
 
         menu.append(Gtk.SeparatorMenuItem())
