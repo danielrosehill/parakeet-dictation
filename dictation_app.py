@@ -79,8 +79,9 @@ class AppConfig:
     beep_volume: float = 0.5
     audio_device: str = ""  # Empty = system default; otherwise device name or index
 
-    # Typing method: "wtype" (recommended), "ydotool" (needs daemon), "clipboard" (wl-copy+wtype paste)
-    typer: str = "wtype"
+    # Typing method: "clipboard" (wl-copy+Ctrl+V, works on all compositors),
+    #   "wtype" (needs virtual-keyboard protocol), "ydotool" (needs daemon+uinput)
+    typer: str = "clipboard"
 
     # Hotkey mode: "toggle" (one key) or "start_stop" (separate keys)
     hotkey_mode: str = "toggle"
@@ -207,7 +208,7 @@ def resolve_audio_device(config_value: str):
 # ---------------------------------------------------------------------------
 
 class TextTyper:
-    def __init__(self, method: str = "wtype"):
+    def __init__(self, method: str = "clipboard"):
         self._method = method
 
     def type_text(self, text: str):
@@ -215,17 +216,20 @@ class TextTyper:
         if not text:
             return
         try:
-            if self._method == "wtype":
+            if self._method == "clipboard":
+                subprocess.run(["wl-copy", "--", text + " "], timeout=5)
+                import time; time.sleep(0.05)
+                subprocess.run(["xdotool", "key", "ctrl+v"], timeout=5)
+            elif self._method == "wtype":
                 subprocess.run(["wtype", "--", text + " "], timeout=5)
             elif self._method == "ydotool":
                 subprocess.run(["ydotool", "type", "--", text + " "], timeout=5)
-            elif self._method == "clipboard":
-                subprocess.run(["wl-copy", "--", text + " "], timeout=5)
-                subprocess.run(["wtype", "-M", "ctrl", "v", "-m", "ctrl"], timeout=5)
             else:
-                subprocess.run(["wtype", "--", text + " "], timeout=5)
+                subprocess.run(["wl-copy", "--", text + " "], timeout=5)
+                import time; time.sleep(0.05)
+                subprocess.run(["xdotool", "key", "ctrl+v"], timeout=5)
         except FileNotFoundError:
-            print(f"ERROR: {self._method} not found. Install wtype: sudo apt install wtype", file=sys.stderr)
+            print(f"ERROR: {self._method} not found.", file=sys.stderr)
         except subprocess.TimeoutExpired:
             pass
 
@@ -613,7 +617,6 @@ class DictationController:
         self._profiles_data = load_model_profiles()
         self._engine = None
         self._status_callback = None
-        self._transcript_callback = None
         self._rebuild_engine()
 
     def _rebuild_engine(self):
@@ -630,8 +633,6 @@ class DictationController:
     def set_status_callback(self, cb):
         self._status_callback = cb
 
-    def set_transcript_callback(self, cb):
-        self._transcript_callback = cb
 
     @property
     def is_running(self) -> bool:
@@ -684,8 +685,6 @@ class DictationController:
 
     def _on_final_text(self, text: str):
         self._typer.type_text(text)
-        if self._transcript_callback:
-            self._transcript_callback(text)
         if self._status_callback:
             self._status_callback("")
 
@@ -1436,9 +1435,9 @@ class SettingsDialog(Gtk.Dialog):
         hbox_typer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         hbox_typer.pack_start(Gtk.Label(label="Typing method:"), False, False, 0)
         self._typer_combo = Gtk.ComboBoxText()
-        self._typer_combo.append("wtype", "wtype (recommended)")
-        self._typer_combo.append("ydotool", "ydotool (needs daemon)")
-        self._typer_combo.append("clipboard", "Clipboard paste (wl-copy)")
+        self._typer_combo.append("clipboard", "Clipboard paste (recommended)")
+        self._typer_combo.append("wtype", "wtype (GNOME/Sway only)")
+        self._typer_combo.append("ydotool", "ydotool (needs daemon+uinput)")
         self._typer_combo.set_active_id(self._config.typer)
         hbox_typer.pack_start(self._typer_combo, False, False, 0)
         box.pack_start(hbox_typer, False, False, 0)
@@ -1576,92 +1575,65 @@ class MainWindow(Gtk.Window):
         super().__init__(title=APP_NAME)
         self._controller = controller
         self._hotkey_mgr = hotkey_mgr
-        self.set_default_size(600, 450)
+        self.set_default_size(480, -1)
+        self.set_resizable(False)
         self.set_icon_name("audio-input-microphone")
         self.connect("delete-event", self._on_delete)
 
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        vbox.set_margin_start(16)
+        vbox.set_margin_end(16)
+        vbox.set_margin_top(16)
+        vbox.set_margin_bottom(16)
         self.add(vbox)
 
-        # --- Header bar with controls ---
-        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        header.set_margin_start(12)
-        header.set_margin_end(12)
-        header.set_margin_top(8)
-        header.set_margin_bottom(8)
+        # --- Status ---
+        self._status_label = Gtk.Label()
+        self._status_label.set_markup("<span size='large'>Idle</span>")
+        self._status_label.set_halign(Gtk.Align.CENTER)
+        vbox.pack_start(self._status_label, False, False, 0)
+
+        # --- Controls ---
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_box.set_halign(Gtk.Align.CENTER)
 
         self._toggle_btn = Gtk.Button()
         self._toggle_btn.get_style_context().add_class("suggested-action")
         self._toggle_btn.connect("clicked", self._on_toggle)
-        header.pack_start(self._toggle_btn, False, False, 0)
+        btn_box.pack_start(self._toggle_btn, False, False, 0)
 
         self._pause_btn = Gtk.Button(label="Pause")
         self._pause_btn.set_sensitive(False)
         self._pause_btn.connect("clicked", lambda _: self._controller.pause())
-        header.pack_start(self._pause_btn, False, False, 0)
+        btn_box.pack_start(self._pause_btn, False, False, 0)
 
-        self._status_label = Gtk.Label(label="Idle")
-        self._status_label.set_halign(Gtk.Align.START)
-        self._status_label.set_hexpand(True)
-        self._status_label.set_margin_start(12)
-        header.pack_start(self._status_label, True, True, 0)
+        vbox.pack_start(btn_box, False, False, 0)
 
-        # Microphone selector in header
+        vbox.pack_start(Gtk.Separator(), False, False, 0)
+
+        # --- Microphone selector ---
+        mic_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        mic_box.pack_start(Gtk.Label(label="Microphone:"), False, False, 0)
         self._mic_combo = Gtk.ComboBoxText()
-        self._mic_combo.append("", "Default mic")
+        self._mic_combo.append("", "System Default")
         for dev in list_input_devices():
             self._mic_combo.append(str(dev["index"]), dev["name"])
         self._mic_combo.set_active_id(self._controller.config.audio_device or "")
         self._mic_combo.connect("changed", self._on_mic_changed)
-        header.pack_end(self._mic_combo, False, False, 0)
-        header.pack_end(Gtk.Label(label="Mic:"), False, False, 0)
+        mic_box.pack_start(self._mic_combo, True, True, 0)
+        vbox.pack_start(mic_box, False, False, 0)
 
-        vbox.pack_start(header, False, False, 0)
-        vbox.pack_start(Gtk.Separator(), False, False, 0)
-
-        # --- Transcript area ---
-        sw = Gtk.ScrolledWindow()
-        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        sw.set_vexpand(True)
-
-        self._textview = Gtk.TextView()
-        self._textview.set_editable(False)
-        self._textview.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self._textview.set_left_margin(12)
-        self._textview.set_right_margin(12)
-        self._textview.set_top_margin(8)
-        self._textview.set_bottom_margin(8)
-        self._textbuf = self._textview.get_buffer()
-        sw.add(self._textview)
-        vbox.pack_start(sw, True, True, 0)
-
-        # --- Bottom bar ---
-        bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        bottom.set_margin_start(12)
-        bottom.set_margin_end(12)
-        bottom.set_margin_top(6)
-        bottom.set_margin_bottom(6)
-
-        clear_btn = Gtk.Button(label="Clear")
-        clear_btn.connect("clicked", lambda _: self._textbuf.set_text(""))
-        bottom.pack_start(clear_btn, False, False, 0)
-
-        copy_btn = Gtk.Button(label="Copy All")
-        copy_btn.connect("clicked", self._on_copy_all)
-        bottom.pack_start(copy_btn, False, False, 0)
-
+        # --- Model display ---
         self._model_label = Gtk.Label()
-        self._model_label.set_halign(Gtk.Align.END)
+        self._model_label.set_halign(Gtk.Align.CENTER)
         self._model_label.get_style_context().add_class("dim-label")
-        bottom.pack_end(self._model_label, False, False, 0)
-
-        vbox.pack_start(bottom, False, False, 0)
+        vbox.pack_start(self._model_label, False, False, 0)
 
         self._update_controls()
 
     def _on_delete(self, _win, _event):
         self.hide()
-        return True  # Don't destroy, just hide
+        return True
 
     def _on_toggle(self, _btn):
         self._controller.toggle()
@@ -1673,12 +1645,6 @@ class MainWindow(Gtk.Window):
         cfg.audio_device = dev_id
         cfg.save()
 
-    def _on_copy_all(self, _btn):
-        start, end = self._textbuf.get_bounds()
-        text = self._textbuf.get_text(start, end, False)
-        if text:
-            subprocess.run(["wl-copy", "--", text], timeout=5)
-
     def _update_controls(self):
         running = self._controller.is_running
         paused = self._controller.is_paused
@@ -1687,40 +1653,26 @@ class MainWindow(Gtk.Window):
         if running:
             if paused:
                 self._toggle_btn.set_label("Resume")
-                self._status_label.set_text("Paused")
+                self._status_label.set_markup("<span size='large'>Paused</span>")
             else:
                 self._toggle_btn.set_label("Stop")
-                self._status_label.set_text("Listening...")
+                self._status_label.set_markup("<span size='large'>Listening...</span>")
             self._pause_btn.set_sensitive(True)
         else:
             self._toggle_btn.set_label("Start Dictation")
-            self._status_label.set_text("Idle")
+            self._status_label.set_markup("<span size='large'>Idle</span>")
             self._pause_btn.set_sensitive(False)
 
         profile_name = self._controller.profiles.get(
             cfg.model_profile, {}
         ).get("name", cfg.model_profile)
-        self._model_label.set_markup(f"<small>{profile_name}</small>")
+        self._model_label.set_markup(f"<small>Model: {profile_name}</small>")
 
     def on_status_update(self, text: str):
-        """Called by the controller status callback (on the GTK main thread)."""
         self._update_controls()
         if text and text not in ("Listening...", "Ready", "Resumed", "Paused"):
-            display = text[:80] + "\u2026" if len(text) > 80 else text
-            self._status_label.set_text(f"\u25b6 {display}")
-
-    def append_transcript(self, text: str):
-        """Append final transcribed text to the transcript view."""
-        end_iter = self._textbuf.get_end_iter()
-        existing = self._textbuf.get_char_count()
-        if existing > 0:
-            self._textbuf.insert(end_iter, " ")
-            end_iter = self._textbuf.get_end_iter()
-        self._textbuf.insert(end_iter, text)
-        # Auto-scroll to bottom
-        mark = self._textbuf.get_insert()
-        self._textbuf.place_cursor(self._textbuf.get_end_iter())
-        self._textview.scroll_mark_onscreen(mark)
+            display = text[:60] + "\u2026" if len(text) > 60 else text
+            self._status_label.set_markup(f"<span size='large'>\u25b6 {GLib.markup_escape_text(display)}</span>")
 
 
 # ---------------------------------------------------------------------------
@@ -1880,8 +1832,8 @@ def main():
     _active_config = config
 
     # Ensure typer is a valid Wayland method
-    if config.typer not in ("wtype", "ydotool", "clipboard"):
-        config.typer = "wtype"
+    if config.typer not in ("clipboard", "wtype", "ydotool"):
+        config.typer = "clipboard"
 
     controller = DictationController(config)
 
@@ -1897,7 +1849,6 @@ def main():
     )
 
     main_window = MainWindow(controller, hotkey_mgr)
-    controller.set_transcript_callback(main_window.append_transcript)
 
     tray = TrayIcon(controller, hotkey_mgr, main_window)
     hotkey_mgr.start()
