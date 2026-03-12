@@ -14,10 +14,20 @@ Lightweight, local-friendly dictation tool for Ubuntu based on NVIDIA Parakeet (
 - **In-Sight** (on Hugging Face) — specifically designed for ASR at the edge, but was not found to be very accurate in testing.
 - **sherpa-onnx** is the runtime — it provides a clean Python API over ONNX-exported NeMo models, handles VAD, streaming, and works purely on CPU.
 
-## VAD Options
+## Language Support per Model
 
-- **Silero VAD** — current default. Works well, widely used. ~2.3 MB ONNX model.
-- **TEN VAD** (ten-vad) — used in user's AI-Transcription-Notepad project. Very lightweight (~306 KB native library), bundled with pip package (no separate model download), Apache 2.0 licensed. High performance. Uses TenVad class with hop_size=256, threshold=0.5. Requires `libc++1` on Linux. Worth evaluating as lighter alternative to Silero.
+- **Parakeet TDT 0.6B** — Supports 25 European languages but the sherpa-onnx `from_transducer()` API has **no language parameter**. The model auto-detects the spoken language. There is no way to force/hint a specific language. If it occasionally outputs wrong-language fragments, `rule_fsts` (finite state transducers for constraining output tokens) may help, but that's an advanced configuration.
+- **Canary 180M Flash** — Supports EN, ES, DE, FR with **explicit `src_lang` and `tgt_lang` parameters** via `from_nemo_canary()`. Setting `src_lang="en"` deterministically constrains recognition to English. This is the only model with a proper language selector. Setting `src_lang != tgt_lang` enables speech translation (e.g., speak Spanish, get English text).
+- **Nemotron Streaming 0.6B** — English only. No language parameter needed or available.
+
+**Recommendation**: For users who want deterministic single-language recognition, Canary with an explicit language setting is the most reliable. Parakeet generally auto-detects well for English speakers but cannot be locked to a single language via the API.
+
+## VAD
+
+Using **TEN VAD** (ten-vad) — switched from Silero VAD in v1.0.0.
+
+- **TEN VAD** (~306 KB native library, bundled in pip package, Apache 2.0). No separate model download needed. High performance. Uses hop_size=256, threshold=0.5. Requires `libc++1` on Linux.
+- **Silero VAD** (previous, removed) — 2.3 MB ONNX model, required separate download. Worked well but heavier.
 
 ## GPU Acceleration Question
 

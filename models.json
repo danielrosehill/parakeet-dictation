@@ -3,6 +3,8 @@
     "desktop": {
       "name": "Parakeet TDT 0.6B v3 (int8)",
       "description": "Best accuracy, 25 European languages. ~639 MB download, ~2 GB RAM.",
+      "recommended_for": "Desktops and workstations",
+      "hardware_label": "CPU",
       "params": "600M",
       "size_mb": 639,
       "streaming": false,
@@ -31,6 +33,9 @@
     "laptop": {
       "name": "Canary 180M Flash (int8)",
       "description": "Lightweight, 4 languages (EN/ES/DE/FR). ~198 MB download, ~500 MB RAM.",
+      "recommended_for": "Laptops and low-RAM machines",
+      "hardware_label": "CPU",
+      "languages": ["en", "es", "de", "fr"],
       "params": "180M",
       "size_mb": 198,
       "streaming": false,
@@ -56,6 +61,8 @@
     "streaming": {
       "name": "Nemotron Streaming 0.6B (int8)",
       "description": "True real-time streaming, English only. ~631 MB download, ~2 GB RAM.",
+      "recommended_for": "Real-time use on desktops",
+      "hardware_label": "CPU",
       "params": "600M",
       "size_mb": 631,
       "streaming": true,
