@@ -1063,7 +1063,7 @@ LANG_LABELS = {"en": "English", "es": "Spanish", "de": "German", "fr": "French"}
 
 
 class WelcomeDialog(Gtk.Dialog):
-    """First-run dialog shown when no models are downloaded yet."""
+    """First-run dialog — downloads all models automatically."""
 
     def __init__(self, profiles_data: dict, config: AppConfig, on_model_ready):
         super().__init__(title=f"Welcome to {APP_NAME}", flags=0)
@@ -1071,7 +1071,7 @@ class WelcomeDialog(Gtk.Dialog):
         self._profiles = profiles_data["profiles"]
         self._config = config
         self._on_model_ready = on_model_ready
-        self.set_default_size(520, 480)
+        self.set_default_size(440, 280)
         self.set_deletable(False)
 
         box = self.get_content_area()
@@ -1081,7 +1081,6 @@ class WelcomeDialog(Gtk.Dialog):
         box.set_margin_top(16)
         box.set_margin_bottom(16)
 
-        # Welcome header
         header = Gtk.Label()
         header.set_markup(
             f"<span size='x-large' weight='bold'>Welcome to {APP_NAME}</span>"
@@ -1089,96 +1088,42 @@ class WelcomeDialog(Gtk.Dialog):
         header.set_halign(Gtk.Align.START)
         box.pack_start(header, False, False, 0)
 
+        total_mb = sum(m["size_mb"] for m in self._profiles.values())
         subtitle = Gtk.Label()
         subtitle.set_markup(
-            "To get started, download a speech recognition model.\n"
-            "Choose the one that best fits your hardware:"
+            f"Three speech recognition models will be downloaded\n"
+            f"so you can switch between them freely.\n\n"
+            f"Total download: <b>~{total_mb} MB</b>"
         )
         subtitle.set_halign(Gtk.Align.START)
         subtitle.set_line_wrap(True)
         box.pack_start(subtitle, False, False, 0)
 
-        # Model cards
+        # Model summary (read-only)
         for mid, mdata in self._profiles.items():
-            frame = Gtk.Frame()
-            frame.set_shadow_type(Gtk.ShadowType.ETCHED_IN)
-
-            fbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-            fbox.set_margin_start(12)
-            fbox.set_margin_end(12)
-            fbox.set_margin_top(10)
-            fbox.set_margin_bottom(10)
-
-            # Info
-            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-            name_label = Gtk.Label()
-            name_label.set_markup(f"<b>{mdata['name']}</b>")
-            name_label.set_halign(Gtk.Align.START)
-            vbox.pack_start(name_label, False, False, 0)
-
-            # Recommendation tag
-            rec = mdata.get("recommended_for", "")
-            hw = mdata.get("hardware_label", "CPU")
-            langs = mdata.get("languages")
-            tag_parts = []
-            if rec:
-                tag_parts.append(rec)
-            tag_parts.append(f"{hw}")
-            tag_parts.append(f"{mdata['size_mb']} MB")
-            if langs:
-                tag_parts.append("/".join(l.upper() for l in langs))
-            if mdata.get("streaming"):
-                tag_parts.append("Streaming")
-            tag_label = Gtk.Label()
-            tag_label.set_markup(
-                f"<small>{' · '.join(tag_parts)}</small>"
+            lbl = Gtk.Label()
+            tag = "Streaming" if mdata.get("streaming") else "VAD-segmented"
+            lbl.set_markup(
+                f"  \u2022 <b>{mdata['name']}</b>  ({mdata['size_mb']} MB, {tag})"
             )
-            tag_label.set_halign(Gtk.Align.START)
-            tag_label.get_style_context().add_class("dim-label")
-            vbox.pack_start(tag_label, False, False, 0)
+            lbl.set_halign(Gtk.Align.START)
+            lbl.get_style_context().add_class("dim-label")
+            box.pack_start(lbl, False, False, 0)
 
-            desc_label = Gtk.Label(label=mdata.get("description", ""))
-            desc_label.set_halign(Gtk.Align.START)
-            desc_label.set_line_wrap(True)
-            desc_label.set_max_width_chars(45)
-            desc_label.get_style_context().add_class("dim-label")
-            vbox.pack_start(desc_label, False, False, 0)
-
-            fbox.pack_start(vbox, True, True, 0)
-
-            # Download button with icon
-            dl_btn = Gtk.Button()
-            btn_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            btn_hbox.pack_start(
-                Gtk.Image.new_from_icon_name("folder-download-symbolic", Gtk.IconSize.BUTTON),
-                False, False, 0,
-            )
-            btn_hbox.pack_start(Gtk.Label(label="Download"), False, False, 0)
-            dl_btn.add(btn_hbox)
-            dl_btn.get_style_context().add_class("suggested-action")
-            dl_btn.set_valign(Gtk.Align.CENTER)
-            dl_btn.connect("clicked", self._on_download, mid, dl_btn)
-            fbox.pack_end(dl_btn, False, False, 0)
-
-            frame.add(fbox)
-            box.pack_start(frame, False, False, 0)
-
-        # Download All button
-        total_mb = sum(m["size_mb"] for m in self._profiles.values())
-        dl_all_btn = Gtk.Button()
-        dl_all_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        dl_all_hbox.set_halign(Gtk.Align.CENTER)
-        dl_all_hbox.pack_start(
+        # Download button
+        self._dl_btn = Gtk.Button()
+        dl_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        dl_hbox.set_halign(Gtk.Align.CENTER)
+        dl_hbox.pack_start(
             Gtk.Image.new_from_icon_name("folder-download-symbolic", Gtk.IconSize.BUTTON),
             False, False, 0,
         )
-        dl_all_hbox.pack_start(
-            Gtk.Label(label=f"Download All Models ({total_mb} MB)"), False, False, 0,
-        )
-        dl_all_btn.add(dl_all_hbox)
-        dl_all_btn.set_margin_top(4)
-        dl_all_btn.connect("clicked", self._on_download_all)
-        box.pack_start(dl_all_btn, False, False, 0)
+        dl_hbox.pack_start(Gtk.Label(label="Download All Models"), False, False, 0)
+        self._dl_btn.add(dl_hbox)
+        self._dl_btn.get_style_context().add_class("suggested-action")
+        self._dl_btn.set_margin_top(8)
+        self._dl_btn.connect("clicked", self._on_download_all)
+        box.pack_start(self._dl_btn, False, False, 0)
 
         # Progress bar (hidden until download starts)
         self._progress_bar = Gtk.ProgressBar()
@@ -1213,7 +1158,7 @@ class WelcomeDialog(Gtk.Dialog):
 
         def on_done(success, err):
             if success:
-                self._config.model_profile = "laptop"
+                self._config.model_profile = "desktop"
                 self._config.save()
                 self.destroy()
                 if self._on_model_ready:
@@ -1226,30 +1171,6 @@ class WelcomeDialog(Gtk.Dialog):
                 print(f"Download error: {err}", file=sys.stderr)
 
         _download_all_models(self._profiles_data, on_progress, on_done)
-
-    def _on_download(self, _btn, model_id, btn_widget):
-        btn_widget.set_sensitive(False)
-        self._progress_bar.show()
-        self._error_label.hide()
-
-        def on_progress(msg, fraction):
-            self._update_progress(msg, fraction)
-
-        def on_done(success, err):
-            if success:
-                self._config.model_profile = model_id
-                self._config.save()
-                self.destroy()
-                if self._on_model_ready:
-                    self._on_model_ready(self._config)
-            else:
-                btn_widget.set_sensitive(True)
-                self._progress_bar.hide()
-                self._error_label.set_markup(f"<span color='red'>Download failed: {GLib.markup_escape_text(err)}</span>")
-                self._error_label.show()
-                print(f"Download error: {err}", file=sys.stderr)
-
-        _download_model(model_id, self._profiles_data, on_progress, on_done)
 
 
 class SettingsDialog(Gtk.Dialog):
@@ -1776,6 +1697,22 @@ class MainWindow(Gtk.Window):
         model_box.pack_start(self._model_combo, True, True, 0)
         vbox.pack_start(model_box, False, False, 0)
 
+        # --- Streaming toggle ---
+        self._streaming_check = Gtk.CheckButton(label="Streaming mode (type as you speak)")
+        self._streaming_check.set_tooltip_text(
+            "Switch between real-time streaming (Nemotron) and "
+            "VAD-segmented transcription (waits for pause, higher accuracy).")
+        is_streaming = self._controller.profiles.get(
+            self._controller.config.model_profile, {}).get("streaming", False)
+        self._streaming_check.set_active(is_streaming)
+        # Remember the non-streaming model so we can restore it
+        if is_streaming:
+            self._non_streaming_model = "desktop"
+        else:
+            self._non_streaming_model = self._controller.config.model_profile
+        self._streaming_check.connect("toggled", self._on_streaming_toggled)
+        vbox.pack_start(self._streaming_check, False, False, 0)
+
         self._update_controls()
 
     def _on_delete(self, _win, _event):
@@ -1803,6 +1740,42 @@ class MainWindow(Gtk.Window):
         new_config.model_profile = model_id
         self._controller.apply_config(new_config)
         self._hotkey_mgr.rebuild(new_config)
+        # Keep streaming checkbox in sync
+        is_streaming = self._controller.profiles.get(model_id, {}).get("streaming", False)
+        self._streaming_check.handler_block_by_func(self._on_streaming_toggled)
+        self._streaming_check.set_active(is_streaming)
+        self._streaming_check.handler_unblock_by_func(self._on_streaming_toggled)
+        if not is_streaming:
+            self._non_streaming_model = model_id
+        if hasattr(self, "_tray") and self._tray:
+            self._tray._build_menu()
+            self._tray.update_ui()
+
+    def _on_streaming_toggled(self, check):
+        if check.get_active():
+            # Remember current non-streaming model, switch to streaming
+            cur = self._controller.config.model_profile
+            cur_profile = self._controller.profiles.get(cur, {})
+            if not cur_profile.get("streaming", False):
+                self._non_streaming_model = cur
+            target = "streaming"
+        else:
+            # Restore previous non-streaming model
+            target = getattr(self, "_non_streaming_model", "desktop")
+
+        if not _is_model_downloaded(target, self._controller.profiles):
+            # Can't switch — revert checkbox
+            check.handler_block_by_func(self._on_streaming_toggled)
+            check.set_active(not check.get_active())
+            check.handler_unblock_by_func(self._on_streaming_toggled)
+            return
+
+        new_config = self._controller.config
+        new_config.model_profile = target
+        self._controller.apply_config(new_config)
+        self._hotkey_mgr.rebuild(new_config)
+        # Sync the model combo
+        self._model_combo.set_active_id(target)
         if hasattr(self, "_tray") and self._tray:
             self._tray._build_menu()
             self._tray.update_ui()
@@ -1825,9 +1798,15 @@ class MainWindow(Gtk.Window):
             self._status_label.set_markup("<span size='large'>Idle</span>")
             self._pause_btn.set_sensitive(False)
 
-        # Sync model combo if changed externally (e.g. via tray)
+        # Sync model combo and streaming checkbox if changed externally
         if self._model_combo.get_active_id() != cfg.model_profile:
             self._model_combo.set_active_id(cfg.model_profile)
+        is_streaming = self._controller.profiles.get(
+            cfg.model_profile, {}).get("streaming", False)
+        if self._streaming_check.get_active() != is_streaming:
+            self._streaming_check.handler_block_by_func(self._on_streaming_toggled)
+            self._streaming_check.set_active(is_streaming)
+            self._streaming_check.handler_unblock_by_func(self._on_streaming_toggled)
 
     def on_status_update(self, text: str):
         self._update_controls()

@@ -3,7 +3,7 @@
 # Usage: ./build-deb.sh
 set -e
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 PKG_NAME="parakeet-dictation"
 BUILD_DIR="$(mktemp -d)"
 PKG_DIR="$BUILD_DIR/${PKG_NAME}_${VERSION}"
