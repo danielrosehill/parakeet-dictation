@@ -7,6 +7,7 @@ configurable hotkeys and VAD-segmented or true streaming transcription.
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -90,6 +91,14 @@ class AppConfig:
     night_mode: bool = True
     night_start: int = 22  # 10 PM
     night_end: int = 9     # 9 AM
+
+    # Streaming partial-overwrite: type partials into active window and
+    # backspace-retype when the model revises.  When False, partials are
+    # shown only in the status bar and text is typed on final endpoint.
+    partial_overwrite: bool = True
+
+    # Strip filler words ("um", "uh", "ehm" …) before injecting text
+    filter_fillers: bool = True
 
     # Language (for models that support it, e.g. Canary)
     language: str = "en"
@@ -204,34 +213,112 @@ def resolve_audio_device(config_value: str):
 
 
 # ---------------------------------------------------------------------------
+# Filler word filter
+# ---------------------------------------------------------------------------
+
+_FILLER_RE = re.compile(
+    r"\b(?:um|uh|uhm|ehm|hmm|er|ah|erm|hm)\b",
+    re.IGNORECASE,
+)
+_MULTI_SPACE_RE = re.compile(r"  +")
+
+
+def filter_fillers(text: str) -> str:
+    """Remove common filler words, collapse resulting double-spaces."""
+    text = _FILLER_RE.sub("", text)
+    text = _MULTI_SPACE_RE.sub(" ", text).strip()
+    return text
+
+
+# ---------------------------------------------------------------------------
 # Text typer
 # ---------------------------------------------------------------------------
 
 class TextTyper:
     def __init__(self, method: str = "clipboard"):
         self._method = method
+        # Tracks how many characters of the current partial are on-screen
+        # so we can backspace them before typing a revision.
+        self._partial_len = 0
 
-    def type_text(self, text: str):
-        text = text.strip()
-        if not text:
-            return
+    # -- low-level helpers --------------------------------------------------
+
+    def _type_raw(self, text: str):
+        """Type a string into the active window (no newline safety)."""
         try:
             if self._method == "clipboard":
-                subprocess.run(["wl-copy", "--", text + " "], timeout=5)
+                subprocess.run(["wl-copy", "--", text], timeout=5)
                 import time; time.sleep(0.05)
                 subprocess.run(["xdotool", "key", "ctrl+v"], timeout=5)
             elif self._method == "wtype":
-                subprocess.run(["wtype", "--", text + " "], timeout=5)
+                subprocess.run(["wtype", "--", text], timeout=5)
             elif self._method == "ydotool":
-                subprocess.run(["ydotool", "type", "--", text + " "], timeout=5)
+                subprocess.run(["ydotool", "type", "--", text], timeout=5)
             else:
-                subprocess.run(["wl-copy", "--", text + " "], timeout=5)
+                subprocess.run(["wl-copy", "--", text], timeout=5)
                 import time; time.sleep(0.05)
                 subprocess.run(["xdotool", "key", "ctrl+v"], timeout=5)
         except FileNotFoundError:
             print(f"ERROR: {self._method} not found.", file=sys.stderr)
         except subprocess.TimeoutExpired:
             pass
+
+    def _send_backspaces(self, count: int):
+        """Erase *count* characters via repeated BackSpace key presses."""
+        if count <= 0:
+            return
+        try:
+            if self._method in ("ydotool",):
+                # ydotool key accepts X11 keycodes; BackSpace = 14
+                for _ in range(count):
+                    subprocess.run(["ydotool", "key", "14:1", "14:0"], timeout=5)
+            elif self._method == "wtype":
+                for _ in range(count):
+                    subprocess.run(["wtype", "-k", "BackSpace"], timeout=5)
+            else:
+                # clipboard method — fall back to xdotool for backspace
+                for _ in range(count):
+                    subprocess.run(["xdotool", "key", "BackSpace"], timeout=5)
+        except FileNotFoundError:
+            print(f"ERROR: backspace helper not found for {self._method}.", file=sys.stderr)
+        except subprocess.TimeoutExpired:
+            pass
+
+    @staticmethod
+    def _sanitize(text: str) -> str:
+        """Strip newlines/carriage-returns — never inject Enter."""
+        return text.replace("\n", " ").replace("\r", " ").strip()
+
+    # -- public API ---------------------------------------------------------
+
+    def type_text(self, text: str):
+        """Type final (committed) text — adds trailing space."""
+        text = self._sanitize(text)
+        if not text:
+            return
+        self._type_raw(text + " ")
+
+    def type_partial(self, text: str):
+        """Type a streaming partial, erasing the previous partial first."""
+        text = self._sanitize(text)
+        if not text:
+            return
+        # Erase whatever we typed last time
+        self._send_backspaces(self._partial_len)
+        self._type_raw(text)
+        self._partial_len = len(text)
+
+    def commit_partial(self, text: str):
+        """Commit (finalize) a partial: erase old partial, type final + space."""
+        text = self._sanitize(text)
+        self._send_backspaces(self._partial_len)
+        self._partial_len = 0
+        if text:
+            self._type_raw(text + " ")
+
+    def reset_partial(self):
+        """Discard partial tracking without erasing anything on screen."""
+        self._partial_len = 0
 
 
 # ---------------------------------------------------------------------------
@@ -350,12 +437,15 @@ class TenVadDetector:
 # ---------------------------------------------------------------------------
 
 class ASREngine:
-    def __init__(self, config: AppConfig, profile: dict, on_text, on_partial, on_error):
+    def __init__(self, config: AppConfig, profile: dict, on_text, on_partial, on_error,
+                 on_partial_type=None, on_commit_partial=None):
         self._config = config
         self._profile = profile
         self._on_text = on_text
         self._on_partial = on_partial
         self._on_error = on_error
+        self._on_partial_type = on_partial_type or (lambda t: None)
+        self._on_commit_partial = on_commit_partial or (lambda t: None)
         self._running = False
         self._paused = False
         self._thread = None
@@ -570,6 +660,7 @@ class ASREngine:
         stream = recognizer.create_stream()
         chunk_duration = 0.1
         samples_per_chunk = int(SAMPLE_RATE * chunk_duration)
+        partial_overwrite = self._config.partial_overwrite
 
         device = resolve_audio_device(self._config.audio_device)
         with sd.InputStream(
@@ -598,11 +689,16 @@ class ASREngine:
                 partial = recognizer.get_result(stream).strip()
                 if partial:
                     GLib.idle_add(self._on_partial, partial)
+                    if partial_overwrite:
+                        GLib.idle_add(self._on_partial_type, partial)
 
                 if recognizer.is_endpoint(stream):
                     text = recognizer.get_result(stream).strip()
                     if text:
-                        GLib.idle_add(self._on_text, text)
+                        if partial_overwrite:
+                            GLib.idle_add(self._on_commit_partial, text)
+                        else:
+                            GLib.idle_add(self._on_text, text)
                     recognizer.reset(stream)
 
 
@@ -628,6 +724,8 @@ class DictationController:
             on_text=self._on_final_text,
             on_partial=self._on_partial,
             on_error=self._on_error,
+            on_partial_type=self._on_partial_type,
+            on_commit_partial=self._on_commit_partial,
         )
 
     def set_status_callback(self, cb):
@@ -660,6 +758,7 @@ class DictationController:
 
     def stop(self):
         self._engine.stop()
+        self._typer.reset_partial()
         if self._status_callback:
             self._status_callback("")
 
@@ -684,7 +783,26 @@ class DictationController:
             self._rebuild_engine()
 
     def _on_final_text(self, text: str):
+        if self._config.filter_fillers:
+            text = filter_fillers(text)
+        if not text:
+            return
         self._typer.type_text(text)
+        if self._status_callback:
+            self._status_callback("")
+
+    def _on_partial_type(self, text: str):
+        """Type a streaming partial into the active window (overwrite prev)."""
+        if self._config.filter_fillers:
+            text = filter_fillers(text)
+        if text:
+            self._typer.type_partial(text)
+
+    def _on_commit_partial(self, text: str):
+        """Commit the streaming partial as final text."""
+        if self._config.filter_fillers:
+            text = filter_fillers(text)
+        self._typer.commit_partial(text)
         if self._status_callback:
             self._status_callback("")
 
@@ -1474,6 +1592,24 @@ class SettingsDialog(Gtk.Dialog):
         hbox_lang.pack_start(lang_hint, False, False, 0)
         box.pack_start(hbox_lang, False, False, 0)
 
+        # Streaming options
+        sep_stream = Gtk.Separator()
+        sep_stream.set_margin_top(4)
+        box.pack_start(sep_stream, False, False, 0)
+
+        self._partial_overwrite_check = Gtk.CheckButton(
+            label="Streaming partial-overwrite (type text as you speak)")
+        self._partial_overwrite_check.set_active(self._config.partial_overwrite)
+        self._partial_overwrite_check.set_tooltip_text(
+            "When enabled, streaming models type partial results into the active window "
+            "and revise them in place.  When disabled, text only appears on final endpoint.")
+        box.pack_start(self._partial_overwrite_check, False, False, 4)
+
+        self._filter_fillers_check = Gtk.CheckButton(
+            label="Filter filler words (um, uh, ehm …)")
+        self._filter_fillers_check.set_active(self._config.filter_fillers)
+        box.pack_start(self._filter_fillers_check, False, False, 4)
+
         # Night mode
         sep = Gtk.Separator()
         sep.set_margin_top(8)
@@ -1509,6 +1645,8 @@ class SettingsDialog(Gtk.Dialog):
         self._config.beep_volume = self._vol_scale.get_value()
         self._config.num_threads = int(self._threads_spin.get_value())
         self._config.language = self._lang_combo.get_active_id() or "en"
+        self._config.partial_overwrite = self._partial_overwrite_check.get_active()
+        self._config.filter_fillers = self._filter_fillers_check.get_active()
         self._config.night_mode = self._night_check.get_active()
         self._config.night_start = int(self._night_start_spin.get_value())
         self._config.night_end = int(self._night_end_spin.get_value())
