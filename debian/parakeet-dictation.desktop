@@ -1,6 +1,6 @@
 [Desktop Entry]
 Name=Parakeet Dictation
-Comment=On-device voice typing with punctuation via sherpa-onnx
+Comment=Local on-device voice typing (no internet required) using NeMo ASR models
 Exec=parakeet-dictation
 Icon=audio-input-microphone
 Terminal=false
