@@ -246,7 +246,11 @@ class TextTyper:
     def _type_raw(self, text: str):
         """Type a string into the active window (no newline safety)."""
         try:
-            if self._method == "clipboard":
+            if self._method == "xdotool":
+                # X11: type directly, no clipboard involved
+                subprocess.run(["xdotool", "type", "--clearmodifiers",
+                                "--delay", "2", "--", text], timeout=30)
+            elif self._method == "clipboard":
                 subprocess.run(["wl-copy", "--", text], timeout=5)
                 import time; time.sleep(0.05)
                 subprocess.run(["xdotool", "key", "ctrl+v"], timeout=5)
@@ -1474,6 +1478,7 @@ class SettingsDialog(Gtk.Dialog):
         hbox_typer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         hbox_typer.pack_start(Gtk.Label(label="Typing method:"), False, False, 0)
         self._typer_combo = Gtk.ComboBoxText()
+        self._typer_combo.append("xdotool", "xdotool type (X11)")
         self._typer_combo.append("clipboard", "Clipboard paste (recommended)")
         self._typer_combo.append("wtype", "wtype (GNOME/Sway only)")
         self._typer_combo.append("ydotool", "ydotool (needs daemon+uinput)")
@@ -1971,8 +1976,8 @@ def main():
     config = AppConfig.load()
     _active_config = config
 
-    # Ensure typer is a valid Wayland method
-    if config.typer not in ("clipboard", "wtype", "ydotool"):
+    # Ensure typer is a valid method
+    if config.typer not in ("xdotool", "clipboard", "wtype", "ydotool"):
         config.typer = "clipboard"
 
     controller = DictationController(config)
