@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -237,27 +238,78 @@ def filter_fillers(text: str) -> str:
 class TextTyper:
     def __init__(self, method: str = "clipboard"):
         self._method = method
-        # Tracks how many characters of the current partial are on-screen
-        # so we can backspace them before typing a revision.
-        self._partial_len = 0
+        # The current partial as typed on-screen, so a revision only needs
+        # to erase/retype the differing tail instead of the whole string.
+        self._partial = ""
+        self._xdisplay = None
+        self._mod_keycodes = ()
+        if method in ("xdotool", "clipboard"):
+            # Heal any phantom modifier a previous crashed/killed injector
+            # left latched.  keyup-only: releases an XTEST-held modifier,
+            # no-op for one the user is physically holding (core state is
+            # the union of all device states).
+            try:
+                subprocess.run(["xdotool", "keyup", "ctrl", "shift", "alt",
+                                "super"], timeout=5, start_new_session=True)
+            except FileNotFoundError:
+                pass
+
+    def _wait_modifiers_up(self, timeout: float = 2.0) -> bool:
+        """Wait until no modifier key is held; True if they were released.
+
+        Typing while the user still holds the hotkey's Ctrl garbles the
+        target app.  xdotool's --clearmodifiers "solves" that by releasing
+        and then RE-PRESSING the modifier — and on Xorg that synthetic
+        re-press outlives the process, latching a phantom Ctrl once the
+        user's physical release has already happened.  So: never touch
+        modifiers, just wait for the user's hand to lift.
+        """
+        try:
+            from Xlib.display import Display
+        except ImportError:
+            return True
+        if self._xdisplay is None:
+            self._xdisplay = Display()
+            self._mod_keycodes = {
+                kc for row in self._xdisplay.get_modifier_mapping()
+                for kc in row if kc}
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            keys = self._xdisplay.query_keymap()
+            if not any(keys[kc >> 3] & (1 << (kc & 7))
+                       for kc in self._mod_keycodes):
+                return True
+            time.sleep(0.02)
+        return False
 
     # -- low-level helpers --------------------------------------------------
 
     def _type_raw(self, text: str):
         """Type a string into the active window (no newline safety)."""
         try:
-            if self._method == "clipboard":
+            if self._method == "xdotool":
+                # X11: type directly, no clipboard involved.  No
+                # --clearmodifiers (see _wait_modifiers_up); new session so
+                # a terminal Ctrl+C on the app can't kill it mid-keystroke.
+                self._wait_modifiers_up()
+                subprocess.run(["xdotool", "type", "--delay", "2", "--",
+                                text], timeout=30, start_new_session=True)
+            elif self._method == "clipboard":
                 subprocess.run(["wl-copy", "--", text], timeout=5)
-                import time; time.sleep(0.05)
-                subprocess.run(["xdotool", "key", "ctrl+v"], timeout=5)
+                time.sleep(0.05)
+                self._wait_modifiers_up()
+                subprocess.run(["xdotool", "key", "ctrl+v"], timeout=5,
+                               start_new_session=True)
             elif self._method == "wtype":
                 subprocess.run(["wtype", "--", text], timeout=5)
             elif self._method == "ydotool":
                 subprocess.run(["ydotool", "type", "--", text], timeout=5)
             else:
                 subprocess.run(["wl-copy", "--", text], timeout=5)
-                import time; time.sleep(0.05)
-                subprocess.run(["xdotool", "key", "ctrl+v"], timeout=5)
+                time.sleep(0.05)
+                self._wait_modifiers_up()
+                subprocess.run(["xdotool", "key", "ctrl+v"], timeout=5,
+                               start_new_session=True)
         except FileNotFoundError:
             print(f"ERROR: {self._method} not found.", file=sys.stderr)
         except subprocess.TimeoutExpired:
@@ -276,9 +328,13 @@ class TextTyper:
                 for _ in range(count):
                     subprocess.run(["wtype", "-k", "BackSpace"], timeout=5)
             else:
-                # clipboard method — fall back to xdotool for backspace
-                for _ in range(count):
-                    subprocess.run(["xdotool", "key", "BackSpace"], timeout=5)
+                # X11 (xdotool/clipboard): one process for the whole burst.
+                # Wait for the hotkey Ctrl to lift so these don't become
+                # Ctrl+BackSpace (delete-word) in the focused app.
+                self._wait_modifiers_up()
+                subprocess.run(["xdotool", "key", "--delay", "2",
+                                "--repeat", str(count), "BackSpace"],
+                               timeout=10, start_new_session=True)
         except FileNotFoundError:
             print(f"ERROR: backspace helper not found for {self._method}.", file=sys.stderr)
         except subprocess.TimeoutExpired:
@@ -288,6 +344,12 @@ class TextTyper:
     def _sanitize(text: str) -> str:
         """Strip newlines/carriage-returns — never inject Enter."""
         return text.replace("\n", " ").replace("\r", " ").strip()
+
+    @staticmethod
+    def _diff(old: str, new: str) -> tuple[int, str]:
+        """Return (backspaces, suffix) that edits *old* into *new*."""
+        i = len(os.path.commonprefix((old, new)))
+        return len(old) - i, new[i:]
 
     # -- public API ---------------------------------------------------------
 
@@ -299,26 +361,30 @@ class TextTyper:
         self._type_raw(text + " ")
 
     def type_partial(self, text: str):
-        """Type a streaming partial, erasing the previous partial first."""
+        """Type a streaming partial, erasing only what the revision changed."""
         text = self._sanitize(text)
-        if not text:
+        if not text or text == self._partial:
             return
-        # Erase whatever we typed last time
-        self._send_backspaces(self._partial_len)
-        self._type_raw(text)
-        self._partial_len = len(text)
+        if not self._wait_modifiers_up():
+            return  # user is holding a modifier; drop — a fresher partial follows
+        backspaces, suffix = self._diff(self._partial, text)
+        self._send_backspaces(backspaces)
+        if suffix:
+            self._type_raw(suffix)
+        self._partial = text
 
     def commit_partial(self, text: str):
-        """Commit (finalize) a partial: erase old partial, type final + space."""
+        """Commit (finalize) a partial: fix up the tail, add trailing space."""
         text = self._sanitize(text)
-        self._send_backspaces(self._partial_len)
-        self._partial_len = 0
+        backspaces, suffix = self._diff(self._partial, text)
+        self._send_backspaces(backspaces)
         if text:
-            self._type_raw(text + " ")
+            self._type_raw(suffix + " ")
+        self._partial = ""
 
     def reset_partial(self):
         """Discard partial tracking without erasing anything on screen."""
-        self._partial_len = 0
+        self._partial = ""
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +518,10 @@ class ASREngine:
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()  # set = NOT paused
         self._pause_event.set()
+        # Monotonic stamp for streaming partials.  The GTK idle queue can
+        # lag behind the 100 ms partial cadence; stale queued partials must
+        # be dropped, not typed, or the app keeps typing after stop.
+        self._partial_seq = 0
 
     def _get_model_dir(self) -> Path:
         return MODELS_DIR / self._config.model_profile
@@ -561,12 +631,18 @@ class ASREngine:
     def stop(self):
         if not self._running:
             return
+        self._partial_seq += 1  # invalidate any queued partial typing
         self._stop_event.set()
         self._pause_event.set()
         if self._thread:
             self._thread.join(timeout=5)
         self._running = False
         self._paused = False
+
+    def _emit_partial_type(self, seq: int, text: str):
+        """Type a partial only if it is still the newest one produced."""
+        if seq == self._partial_seq:
+            self._on_partial_type(text)
 
     def pause(self):
         if not self._running:
@@ -690,7 +766,9 @@ class ASREngine:
                 if partial:
                     GLib.idle_add(self._on_partial, partial)
                     if partial_overwrite:
-                        GLib.idle_add(self._on_partial_type, partial)
+                        self._partial_seq += 1
+                        GLib.idle_add(self._emit_partial_type,
+                                      self._partial_seq, partial)
 
                 if recognizer.is_endpoint(stream):
                     text = recognizer.get_result(stream).strip()
@@ -886,8 +964,22 @@ class HotkeyCaptureButton(Gtk.Button):
     def _on_key(self, _widget, event):
         if not self._capturing:
             return False
+
+        # A modifier press alone must NOT end capture — keep waiting
+        # for the main key (fixes capturing e.g. Ctrl+E).
+        keyname = Gdk.keyval_name(event.keyval).lower()
+        if keyname in ("control_l", "control_r", "alt_l", "alt_r",
+                       "shift_l", "shift_r", "super_l", "super_r",
+                       "meta_l", "meta_r"):
+            return True
+
         self._capturing = False
         self.get_toplevel().disconnect(self._key_handler)
+
+        if keyname == "escape":
+            # Escape cancels capture and keeps the old binding
+            self.set_label(self._display(self._binding))
+            return True
 
         parts = []
         if event.state & Gdk.ModifierType.CONTROL_MASK:
@@ -896,16 +988,27 @@ class HotkeyCaptureButton(Gtk.Button):
             parts.append("<alt>")
         if event.state & Gdk.ModifierType.SHIFT_MASK:
             parts.append("<shift>")
+        if event.state & Gdk.ModifierType.SUPER_MASK:
+            parts.append("<cmd>")  # pynput's name for the Super/Win key
 
-        keyname = Gdk.keyval_name(event.keyval).lower()
-        if keyname in ("control_l", "control_r", "alt_l", "alt_r",
-                       "shift_l", "shift_r", "super_l", "super_r",
-                       "meta_l", "meta_r"):
+        # GDK key names pynput spells differently
+        keyname = {"return": "enter", "kp_enter": "enter", "prior": "page_up",
+                   "next": "page_down", "print": "print_screen"}.get(keyname, keyname)
+        # pynput wants special keys angle-bracketed ("<f9>", "<pause>");
+        # a bare multi-char name makes GlobalHotKeys raise and kills all
+        # hotkeys on the next rebuild.
+        parts.append(keyname if len(keyname) == 1 else f"<{keyname}>")
+
+        binding = "+".join(parts)
+        from pynput.keyboard import HotKey
+        try:
+            HotKey.parse(binding)
+        except ValueError:
+            # Key unknown to pynput — reject capture, keep old binding
             self.set_label(self._display(self._binding))
             return True
 
-        parts.append(keyname)
-        self._binding = "+".join(parts)
+        self._binding = binding
         self.set_label(self._display(self._binding))
         return True
 
@@ -1474,6 +1577,7 @@ class SettingsDialog(Gtk.Dialog):
         hbox_typer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         hbox_typer.pack_start(Gtk.Label(label="Typing method:"), False, False, 0)
         self._typer_combo = Gtk.ComboBoxText()
+        self._typer_combo.append("xdotool", "xdotool type (X11)")
         self._typer_combo.append("clipboard", "Clipboard paste (recommended)")
         self._typer_combo.append("wtype", "wtype (GNOME/Sway only)")
         self._typer_combo.append("ydotool", "ydotool (needs daemon+uinput)")
@@ -1971,8 +2075,8 @@ def main():
     config = AppConfig.load()
     _active_config = config
 
-    # Ensure typer is a valid Wayland method
-    if config.typer not in ("clipboard", "wtype", "ydotool"):
+    # Ensure typer is a valid method
+    if config.typer not in ("xdotool", "clipboard", "wtype", "ydotool"):
         config.typer = "clipboard"
 
     controller = DictationController(config)
