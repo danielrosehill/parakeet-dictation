@@ -898,6 +898,11 @@ class HotkeyCaptureButton(Gtk.Button):
         self._capturing = False
         self.get_toplevel().disconnect(self._key_handler)
 
+        if keyname == "escape":
+            # Escape cancels capture and keeps the old binding
+            self.set_label(self._display(self._binding))
+            return True
+
         parts = []
         if event.state & Gdk.ModifierType.CONTROL_MASK:
             parts.append("<ctrl>")
@@ -905,9 +910,27 @@ class HotkeyCaptureButton(Gtk.Button):
             parts.append("<alt>")
         if event.state & Gdk.ModifierType.SHIFT_MASK:
             parts.append("<shift>")
+        if event.state & Gdk.ModifierType.SUPER_MASK:
+            parts.append("<cmd>")  # pynput's name for the Super/Win key
 
-        parts.append(keyname)
-        self._binding = "+".join(parts)
+        # GDK key names pynput spells differently
+        keyname = {"return": "enter", "kp_enter": "enter", "prior": "page_up",
+                   "next": "page_down", "print": "print_screen"}.get(keyname, keyname)
+        # pynput wants special keys angle-bracketed ("<f9>", "<pause>");
+        # a bare multi-char name makes GlobalHotKeys raise and kills all
+        # hotkeys on the next rebuild.
+        parts.append(keyname if len(keyname) == 1 else f"<{keyname}>")
+
+        binding = "+".join(parts)
+        from pynput.keyboard import HotKey
+        try:
+            HotKey.parse(binding)
+        except ValueError:
+            # Key unknown to pynput — reject capture, keep old binding
+            self.set_label(self._display(self._binding))
+            return True
+
+        self._binding = binding
         self.set_label(self._display(self._binding))
         return True
 
