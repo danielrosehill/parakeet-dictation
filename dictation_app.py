@@ -78,6 +78,14 @@ class AppConfig:
     num_threads: int = min(os.cpu_count() or 4, 8)
     vad_threshold: float = 0.5
 
+    # Max seconds of continuous speech before a chunk is force-transcribed.
+    # 0 = no limit: transcribe only on a pause or when recording stops.
+    max_speech_secs: float = 30.0
+
+    # Seconds of silence that end a chunk and trigger transcription.
+    # 0 = never: everything is one chunk, transcribed when recording stops.
+    pause_secs: float = 0.25
+
     # Audio
     beep_volume: float = 0.5
     audio_device: str = ""  # Empty = system default; otherwise device name or index
@@ -412,7 +420,10 @@ class TenVadDetector:
         self._sample_rate = sample_rate
         self._min_silence_samples = int(min_silence_duration * sample_rate)
         self._min_speech_samples = int(min_speech_duration * sample_rate)
-        self._max_speech_samples = int(max_speech_duration * sample_rate)
+        # <= 0 means unlimited: segment only on silence or explicit flush()
+        self._max_speech_samples = (
+            int(max_speech_duration * sample_rate) if max_speech_duration > 0 else 0
+        )
 
         self._vad = TenVad(hop_size=self._hop_size, threshold=threshold)
 
@@ -461,8 +472,8 @@ class TenVadDetector:
                 self._buffer.extend(float_chunk)
                 self._speech_samples += self._hop_size
 
-                # Force segment if max duration reached
-                if self._speech_samples >= self._max_speech_samples:
+                # Force segment if max duration reached (0 = unlimited)
+                if self._max_speech_samples and self._speech_samples >= self._max_speech_samples:
                     self._emit_segment()
             else:
                 if self._in_speech:
@@ -646,11 +657,15 @@ class ASREngine:
         )
 
     def _build_vad(self):
+        # ponytail: pause_secs 0 maps to an unreachably-large silence threshold
+        # = never emit on pause — the whole recording buffers in RAM and
+        # flush() on stop sends one chunk.  ~27 MB/min of audio; fine for
+        # dictation.
         return TenVadDetector(
             threshold=self._config.vad_threshold,
-            min_silence_duration=0.25,
+            min_silence_duration=self._config.pause_secs or 10**9,
             min_speech_duration=0.25,
-            max_speech_duration=30.0,
+            max_speech_duration=self._config.max_speech_secs,
             sample_rate=SAMPLE_RATE,
         )
 
@@ -1660,6 +1675,42 @@ class SettingsDialog(Gtk.Dialog):
         hbox_lang.pack_start(lang_hint, False, False, 0)
         box.pack_start(hbox_lang, False, False, 0)
 
+        # Pause length that ends a chunk and triggers transcription
+        hbox_pause = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        hbox_pause.pack_start(Gtk.Label(label="Transcribe after a pause of:"), False, False, 0)
+        self._pause_spin = Gtk.SpinButton.new_with_range(0, 30, 0.25)
+        self._pause_spin.set_value(self._config.pause_secs)
+        hbox_pause.pack_start(self._pause_spin, False, False, 0)
+        hbox_pause.pack_start(Gtk.Label(label="seconds"), False, False, 0)
+        box.pack_start(hbox_pause, False, False, 0)
+        pause_hint = Gtk.Label()
+        pause_hint.set_markup(
+            "<small>0 = never — everything you say is transcribed as one "
+            "chunk when you stop recording.</small>")
+        pause_hint.get_style_context().add_class("dim-label")
+        pause_hint.set_halign(Gtk.Align.START)
+        pause_hint.set_line_wrap(True)
+        pause_hint.set_max_width_chars(60)
+        box.pack_start(pause_hint, False, False, 0)
+
+        # Max continuous-speech duration before a forced transcription cut
+        hbox_chunk = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        hbox_chunk.pack_start(Gtk.Label(label="Transcribe after:"), False, False, 0)
+        self._chunk_spin = Gtk.SpinButton.new_with_range(0, 3600, 5)
+        self._chunk_spin.set_value(self._config.max_speech_secs)
+        hbox_chunk.pack_start(self._chunk_spin, False, False, 0)
+        hbox_chunk.pack_start(Gtk.Label(label="seconds of nonstop speech"), False, False, 0)
+        box.pack_start(hbox_chunk, False, False, 0)
+        chunk_hint = Gtk.Label()
+        chunk_hint.set_markup(
+            "<small>Speaking without pausing is cut into chunks this long. "
+            "Set 0 to never cut — text appears when you pause or stop recording.</small>")
+        chunk_hint.get_style_context().add_class("dim-label")
+        chunk_hint.set_halign(Gtk.Align.START)
+        chunk_hint.set_line_wrap(True)
+        chunk_hint.set_max_width_chars(60)
+        box.pack_start(chunk_hint, False, False, 0)
+
         # Streaming options
         sep_stream = Gtk.Separator()
         sep_stream.set_margin_top(4)
@@ -1713,6 +1764,8 @@ class SettingsDialog(Gtk.Dialog):
         self._config.beep_volume = self._vol_scale.get_value()
         self._config.num_threads = int(self._threads_spin.get_value())
         self._config.language = self._lang_combo.get_active_id() or "en"
+        self._config.max_speech_secs = self._chunk_spin.get_value()
+        self._config.pause_secs = self._pause_spin.get_value()
         self._config.partial_overwrite = self._partial_overwrite_check.get_active()
         self._config.filter_fillers = self._filter_fillers_check.get_active()
         self._config.night_mode = self._night_check.get_active()
