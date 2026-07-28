@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -423,6 +424,11 @@ class TenVadDetector:
         self._silence_samples = 0
         self._segments: list[_SpeechSegment] = []
         self._is_speech = False
+        # Pre-roll: keep ~0.3s of the most recent non-speech audio and
+        # prepend it when speech starts, so the soft onset of the first
+        # word (before the detector crosses threshold) isn't clipped.
+        self._preroll: deque[list[float]] = deque(
+            maxlen=max(1, int(0.3 * sample_rate) // self._hop_size))
 
     def accept_waveform(self, samples: list[float]):
         """Feed float32 audio samples (matching sounddevice output)."""
@@ -449,6 +455,9 @@ class TenVadDetector:
                 if not self._in_speech:
                     self._in_speech = True
                     self._speech_samples = 0
+                    for pre in self._preroll:
+                        self._buffer.extend(pre)
+                    self._preroll.clear()
                 self._buffer.extend(float_chunk)
                 self._speech_samples += self._hop_size
 
@@ -463,6 +472,7 @@ class TenVadDetector:
                         self._emit_segment()
                 else:
                     self._is_speech = False
+                    self._preroll.append(float_chunk)
 
             i += self._hop_size
 
@@ -471,7 +481,9 @@ class TenVadDetector:
 
     def _emit_segment(self):
         """Finalize current speech buffer into a segment."""
-        if len(self._buffer) >= self._min_speech_samples:
+        # Gate on actual speech samples — the buffer also holds pre-roll
+        # and trailing silence, which must not qualify a blip as speech.
+        if self._speech_samples >= self._min_speech_samples:
             self._segments.append(_SpeechSegment(list(self._buffer)))
         self._buffer.clear()
         self._in_speech = False
@@ -522,6 +534,37 @@ class ASREngine:
         # lag behind the 100 ms partial cadence; stale queued partials must
         # be dropped, not typed, or the app keeps typing after stop.
         self._partial_seq = 0
+        # The model is cached across starts and loaded in the background at
+        # engine build — a cold load takes seconds and used to run between
+        # the hotkey press and the mic opening, eating the first sentence.
+        self._recognizer = None
+        self._recognizer_lock = threading.Lock()
+        threading.Thread(target=self._warm, daemon=True).start()
+
+    def _get_recognizer(self):
+        with self._recognizer_lock:
+            if self._recognizer is None:
+                if self._profile.get("streaming", False):
+                    self._recognizer = self._build_online_recognizer()
+                else:
+                    self._recognizer = self._build_offline_recognizer()
+            return self._recognizer
+
+    def _warm(self):
+        try:
+            self._ensure_models()
+            recognizer = self._get_recognizer()
+            # First inference allocates lazily; push 0.5s of silence through
+            # so the first real segment decodes at full speed.
+            s = recognizer.create_stream()
+            s.accept_waveform(SAMPLE_RATE, [0.0] * (SAMPLE_RATE // 2))
+            if self._profile.get("streaming", False):
+                while recognizer.is_ready(s):
+                    recognizer.decode_stream(s)
+            else:
+                recognizer.decode_stream(s)
+        except Exception:
+            pass  # missing models etc. are reported when dictation starts
 
     def _get_model_dir(self) -> Path:
         return MODELS_DIR / self._config.model_profile
@@ -680,7 +723,7 @@ class ASREngine:
             play_beep_stop(self._config.beep_volume)
 
     def _run_offline(self):
-        recognizer = self._build_offline_recognizer()
+        recognizer = self._get_recognizer()
         vad = self._build_vad()
         chunk_duration = 0.1
         samples_per_chunk = int(SAMPLE_RATE * chunk_duration)
@@ -732,7 +775,7 @@ class ASREngine:
                 vad.pop()
 
     def _run_streaming(self):
-        recognizer = self._build_online_recognizer()
+        recognizer = self._get_recognizer()
         stream = recognizer.create_stream()
         chunk_duration = 0.1
         samples_per_chunk = int(SAMPLE_RATE * chunk_duration)
