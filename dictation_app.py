@@ -886,6 +886,15 @@ class HotkeyCaptureButton(Gtk.Button):
     def _on_key(self, _widget, event):
         if not self._capturing:
             return False
+
+        # A modifier press alone must NOT end capture — keep waiting
+        # for the main key (fixes capturing e.g. Ctrl+E).
+        keyname = Gdk.keyval_name(event.keyval).lower()
+        if keyname in ("control_l", "control_r", "alt_l", "alt_r",
+                       "shift_l", "shift_r", "super_l", "super_r",
+                       "meta_l", "meta_r"):
+            return True
+
         self._capturing = False
         self.get_toplevel().disconnect(self._key_handler)
 
@@ -896,13 +905,6 @@ class HotkeyCaptureButton(Gtk.Button):
             parts.append("<alt>")
         if event.state & Gdk.ModifierType.SHIFT_MASK:
             parts.append("<shift>")
-
-        keyname = Gdk.keyval_name(event.keyval).lower()
-        if keyname in ("control_l", "control_r", "alt_l", "alt_r",
-                       "shift_l", "shift_r", "super_l", "super_r",
-                       "meta_l", "meta_r"):
-            self.set_label(self._display(self._binding))
-            return True
 
         parts.append(keyname)
         self._binding = "+".join(parts)
