@@ -158,9 +158,13 @@ Open **Settings > Models** to browse available model profiles, download them in-
 
 ### Audio feedback
 
-- **Rising tone** (880 Hz) — dictation started
-- **Falling tone** (440 Hz) — dictation stopped
-- **Double beep** (660 Hz) — paused/resumed
+Cues play from your desktop sound theme (via `canberra-gtk-play`), so they follow the theme and alert volume you set in **System Settings > Sound**:
+
+- **`device-added`** — dictation started
+- **`device-removed`** — dictation stopped
+- **`message`** — paused/resumed
+
+If `canberra-gtk-play` isn't installed (package `gnome-session-canberra` on Debian/Ubuntu), the app falls back to simple sine tones. The in-app beep-volume slider attenuates relative to the system alert volume.
 
 ### Night mode
 

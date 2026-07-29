@@ -24,6 +24,7 @@ Section: sound
 Priority: optional
 Architecture: all
 Depends: python3 (>= 3.10), python3-gi, python3-numpy, gir1.2-ayatanaappindicator3-0.1, libportaudio2, python3-venv, wl-clipboard, xdotool, libc++1
+Recommends: gnome-session-canberra
 Maintainer: Daniel Rosehill <daniel@danielrosehill.co.il>
 Homepage: https://github.com/danielrosehill/parakeet-dictation
 Description: On-device voice typing using Parakeet and NeMo ASR models
