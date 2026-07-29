@@ -8,6 +8,7 @@ configurable hotkeys and VAD-segmented or true streaming transcription.
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -171,29 +172,45 @@ def _is_night_mode(config: "AppConfig") -> bool:
 # Global config ref for beep functions (set in main)
 _active_config: "AppConfig | None" = None
 
+# canberra-gtk-play plays named events from the user's desktop sound theme,
+# honoring the theme choice and alert volume in system Settings -> Sound.
+_CANBERRA = shutil.which("canberra-gtk-play")
+
+
+def _play_event(event_id: str, volume: float, fallback_tone) -> None:
+    """Play an XDG sound-theme event; sine-tone fallback without canberra."""
+    if volume <= 0 or (_active_config and _is_night_mode(_active_config)):
+        return
+    if _CANBERRA:
+        # Beep-volume slider becomes attenuation relative to the alert volume
+        gain_db = 20 * np.log10(min(volume, 1.0))
+        # ponytail: one Popen per beep (~tens of ms latency); switch to
+        # ctypes libcanberra with a cached context if it feels laggy
+        subprocess.Popen(
+            [_CANBERRA, "-i", event_id, "-V", f"{gain_db:.1f}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    else:
+        sd.play(fallback_tone(), samplerate=SAMPLE_RATE)
+
 
 def play_beep_start(volume: float = 0.5):
-    """Rising tone — dictation started."""
-    if _active_config and _is_night_mode(_active_config):
-        return
-    sd.play(_generate_tone(880, 0.15, volume), samplerate=SAMPLE_RATE)
+    """Dictation started — theme 'device-added' sound (rising tone fallback)."""
+    _play_event("device-added", volume, lambda: _generate_tone(880, 0.15, volume))
 
 
 def play_beep_stop(volume: float = 0.5):
-    """Falling tone — dictation stopped."""
-    if _active_config and _is_night_mode(_active_config):
-        return
-    sd.play(_generate_tone(440, 0.15, volume), samplerate=SAMPLE_RATE)
+    """Dictation stopped — theme 'device-removed' sound (falling tone fallback)."""
+    _play_event("device-removed", volume, lambda: _generate_tone(440, 0.15, volume))
 
 
 def play_beep_pause(volume: float = 0.5):
-    """Double short beep — paused/resumed."""
-    if _active_config and _is_night_mode(_active_config):
-        return
-    t1 = _generate_tone(660, 0.07, volume)
-    gap = np.zeros(int(SAMPLE_RATE * 0.05), dtype=np.float32)
-    t2 = _generate_tone(660, 0.07, volume)
-    sd.play(np.concatenate([t1, gap, t2]), samplerate=SAMPLE_RATE)
+    """Paused/resumed — theme 'message' sound (double beep fallback)."""
+    def double_beep():
+        t = _generate_tone(660, 0.07, volume)
+        gap = np.zeros(int(SAMPLE_RATE * 0.05), dtype=np.float32)
+        return np.concatenate([t, gap, t])
+    _play_event("message", volume, double_beep)
 
 
 # ---------------------------------------------------------------------------
