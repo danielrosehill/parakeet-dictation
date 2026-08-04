@@ -270,15 +270,19 @@ class TextTyper:
         self._xdisplay = None
         self._mod_keycodes = ()
         if method in ("xdotool", "clipboard"):
-            # Heal any phantom modifier a previous crashed/killed injector
-            # left latched.  keyup-only: releases an XTEST-held modifier,
-            # no-op for one the user is physically holding (core state is
-            # the union of all device states).
-            try:
-                subprocess.run(["xdotool", "keyup", "ctrl", "shift", "alt",
-                                "super"], timeout=5, start_new_session=True)
-            except FileNotFoundError:
-                pass
+            self._heal_modifiers()
+
+    @staticmethod
+    def _heal_modifiers():
+        """Release any phantom modifier a crashed/killed injector left
+        latched.  keyup-only: releases an XTEST-held modifier, no-op for
+        one the user is physically holding (core state is the union of
+        all device states)."""
+        try:
+            subprocess.run(["xdotool", "keyup", "ctrl", "shift", "alt",
+                            "super"], timeout=5, start_new_session=True)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
 
     def _wait_modifiers_up(self, timeout: float = 2.0) -> bool:
         """Wait until no modifier key is held; True if they were released.
@@ -308,32 +312,53 @@ class TextTyper:
             time.sleep(0.02)
         return False
 
+    def _modifiers_clear(self) -> bool:
+        """True once no modifier is held; never inject on False.
+
+        A modifier down while XTEST types turns every character into a
+        hotkey chord (a held Ctrl made each 't' a Ctrl+T = new terminal
+        in the focused app).  On timeout, heal a possible phantom latch
+        and re-wait; a modifier still down then is physically held, so
+        the caller must drop its keystrokes, not send them.
+        """
+        if self._wait_modifiers_up():
+            return True
+        self._heal_modifiers()
+        return self._wait_modifiers_up()
+
+    def _drop(self, text: str):
+        print(f"WARNING: modifier key held; dropped instead of typing: "
+              f"{text!r}", file=sys.stderr)
+
     # -- low-level helpers --------------------------------------------------
 
     def _type_raw(self, text: str):
         """Type a string into the active window (no newline safety)."""
         try:
-            if self._method == "xdotool":
-                # X11: type directly, no clipboard involved.  No
-                # --clearmodifiers (see _wait_modifiers_up); new session so
-                # a terminal Ctrl+C on the app can't kill it mid-keystroke.
-                self._wait_modifiers_up()
-                subprocess.run(["xdotool", "type", "--delay", "2", "--",
-                                text], timeout=30, start_new_session=True)
-            elif self._method == "clipboard":
-                subprocess.run(["wl-copy", "--", text], timeout=5)
-                time.sleep(0.05)
-                self._wait_modifiers_up()
-                subprocess.run(["xdotool", "key", "ctrl+v"], timeout=5,
-                               start_new_session=True)
-            elif self._method == "wtype":
+            if self._method == "wtype":
                 subprocess.run(["wtype", "--", text], timeout=5)
             elif self._method == "ydotool":
                 subprocess.run(["ydotool", "type", "--", text], timeout=5)
-            else:
+            elif self._method == "xdotool":
+                # X11: type directly, no clipboard involved.  No
+                # --clearmodifiers (see _wait_modifiers_up); new session so
+                # a terminal Ctrl+C on the app can't kill it mid-keystroke.
+                # Small pieces with a modifier re-check between them: a
+                # Ctrl pressed mid-injection chords at most one piece,
+                # then the rest is dropped instead of typed.
+                for i in range(0, len(text), 24):
+                    if not self._modifiers_clear():
+                        self._drop(text[i:])
+                        return
+                    subprocess.run(["xdotool", "type", "--delay", "2", "--",
+                                    text[i:i + 24]],
+                                   timeout=30, start_new_session=True)
+            else:  # "clipboard" and unknown methods
                 subprocess.run(["wl-copy", "--", text], timeout=5)
                 time.sleep(0.05)
-                self._wait_modifiers_up()
+                if not self._modifiers_clear():
+                    self._drop(text)
+                    return
                 subprocess.run(["xdotool", "key", "ctrl+v"], timeout=5,
                                start_new_session=True)
         except FileNotFoundError:
@@ -355,9 +380,11 @@ class TextTyper:
                     subprocess.run(["wtype", "-k", "BackSpace"], timeout=5)
             else:
                 # X11 (xdotool/clipboard): one process for the whole burst.
-                # Wait for the hotkey Ctrl to lift so these don't become
-                # Ctrl+BackSpace (delete-word) in the focused app.
-                self._wait_modifiers_up()
+                # A held Ctrl would make every one a Ctrl+BackSpace
+                # (delete-word) in the focused app — drop, never send.
+                if not self._modifiers_clear():
+                    self._drop(f"<{count} backspaces>")
+                    return
                 subprocess.run(["xdotool", "key", "--delay", "2",
                                 "--repeat", str(count), "BackSpace"],
                                timeout=10, start_new_session=True)
