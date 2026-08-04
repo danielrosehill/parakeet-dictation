@@ -7,6 +7,7 @@ configurable hotkeys and VAD-segmented or true streaming transcription.
 
 import json
 import os
+import queue
 import re
 import shutil
 import signal
@@ -473,7 +474,11 @@ class TenVadDetector:
 
         # Internal state
         self._buffer: list[float] = []  # float32 samples for ASR
-        self._int16_remainder = np.array([], dtype=np.int16)  # leftover for VAD
+        # Sub-hop leftover, kept as float samples so the audio buffered for
+        # ASR and the audio the VAD classifies are sliced from the same
+        # array — a separate int16 remainder desynced them and dropped ~64
+        # samples of real audio per call at chunk boundaries.
+        self._remainder: list[float] = []
         self._in_speech = False
         self._speech_samples = 0
         self._silence_samples = 0
@@ -487,13 +492,10 @@ class TenVadDetector:
 
     def accept_waveform(self, samples: list[float]):
         """Feed float32 audio samples (matching sounddevice output)."""
-        # Convert to int16 for TEN VAD
-        arr = np.array(samples, dtype=np.float32)
-        int16_data = (arr * 32767).astype(np.int16)
-
         # Prepend any leftover from previous call
-        if len(self._int16_remainder) > 0:
-            int16_data = np.concatenate([self._int16_remainder, int16_data])
+        data = self._remainder + list(samples)
+        # Convert to int16 for TEN VAD
+        int16_data = (np.asarray(data, dtype=np.float32) * 32767).astype(np.int16)
 
         # Process in hop_size chunks
         i = 0
@@ -502,7 +504,7 @@ class TenVadDetector:
             prob, _flag = self._vad.process(chunk)
             is_speech = prob >= self._threshold
 
-            float_chunk = samples[i:i + self._hop_size] if i + self._hop_size <= len(samples) else arr[i:i + self._hop_size].tolist()
+            float_chunk = data[i:i + self._hop_size]
 
             if is_speech:
                 self._is_speech = True
@@ -532,7 +534,7 @@ class TenVadDetector:
             i += self._hop_size
 
         # Save leftover
-        self._int16_remainder = int16_data[i:]
+        self._remainder = data[i:]
 
     def _emit_segment(self):
         """Finalize current speech buffer into a segment."""
@@ -781,17 +783,44 @@ class ASREngine:
             self._running = False
             play_beep_stop(self._config.beep_volume)
 
+    def _open_mic(self, samples_per_chunk):
+        """Mic via the PortAudio callback into an unbounded queue.
+
+        The blocking read() path holds only ~0.4s of audio and discards
+        overrun WITHOUT setting the overflowed flag, so any decode stall
+        longer than that silently ate the next words spoken — the classic
+        "first sentence after a pause is missing".  The callback thread is
+        never blocked by decoding, and the queue absorbs any backlog.
+        """
+        audio_q: queue.Queue = queue.Queue()
+
+        def _on_audio(indata, _frames, _time, _status):
+            audio_q.put(indata.reshape(-1).copy())
+
+        device = resolve_audio_device(self._config.audio_device)
+        stream = sd.InputStream(
+            device=device, channels=1, dtype="float32", samplerate=SAMPLE_RATE,
+            blocksize=samples_per_chunk, callback=_on_audio,
+        )
+        return stream, audio_q
+
+    def _drain(self, audio_q) -> list:
+        """Pop everything currently queued (used for pause/stop)."""
+        chunks = []
+        while True:
+            try:
+                chunks.append(audio_q.get_nowait())
+            except queue.Empty:
+                return chunks
+
     def _run_offline(self):
         recognizer = self._get_recognizer()
         vad = self._build_vad()
         chunk_duration = 0.1
         samples_per_chunk = int(SAMPLE_RATE * chunk_duration)
 
-        device = resolve_audio_device(self._config.audio_device)
-        with sd.InputStream(
-            device=device, channels=1, dtype="float32", samplerate=SAMPLE_RATE,
-            blocksize=samples_per_chunk,
-        ) as stream:
+        stream, audio_q = self._open_mic(samples_per_chunk)
+        with stream:
             play_beep_start(self._config.beep_volume)
             GLib.idle_add(self._on_partial, "")
 
@@ -800,13 +829,14 @@ class ASREngine:
                 if self._stop_event.is_set():
                     break
                 if self._paused:
+                    self._drain(audio_q)  # discard mic audio while paused
                     continue
 
-                audio, overflowed = stream.read(samples_per_chunk)
-                if overflowed:
+                try:
+                    audio = audio_q.get(timeout=0.1)
+                except queue.Empty:
                     continue
-                samples = audio.reshape(-1).tolist()
-                vad.accept_waveform(samples)
+                vad.accept_waveform(audio.tolist())
 
                 if vad.is_speech_detected():
                     GLib.idle_add(self._on_partial, "Listening...")
@@ -821,7 +851,9 @@ class ASREngine:
                         GLib.idle_add(self._on_text, text)
                     vad.pop()
 
-            # Flush remaining
+            # Feed audio captured but not yet consumed, then flush
+            for audio in self._drain(audio_q):
+                vad.accept_waveform(audio.tolist())
             vad.flush()
             while not vad.empty():
                 segment = vad.front
@@ -840,11 +872,8 @@ class ASREngine:
         samples_per_chunk = int(SAMPLE_RATE * chunk_duration)
         partial_overwrite = self._config.partial_overwrite
 
-        device = resolve_audio_device(self._config.audio_device)
-        with sd.InputStream(
-            device=device, channels=1, dtype="float32", samplerate=SAMPLE_RATE,
-            blocksize=samples_per_chunk,
-        ) as mic:
+        mic, audio_q = self._open_mic(samples_per_chunk)
+        with mic:
             play_beep_start(self._config.beep_volume)
             GLib.idle_add(self._on_partial, "")
 
@@ -853,13 +882,14 @@ class ASREngine:
                 if self._stop_event.is_set():
                     break
                 if self._paused:
+                    self._drain(audio_q)  # discard mic audio while paused
                     continue
 
-                audio, overflowed = mic.read(samples_per_chunk)
-                if overflowed:
+                try:
+                    audio = audio_q.get(timeout=0.1)
+                except queue.Empty:
                     continue
-                samples = audio.reshape(-1).tolist()
-                stream.accept_waveform(SAMPLE_RATE, samples)
+                stream.accept_waveform(SAMPLE_RATE, audio.tolist())
 
                 while recognizer.is_ready(stream):
                     recognizer.decode_stream(stream)
