@@ -16,7 +16,8 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from datetime import datetime
 from pathlib import Path
 
@@ -111,6 +112,10 @@ class AppConfig:
 
     # Strip filler words ("um", "uh", "ehm" …) before injecting text
     filter_fillers: bool = True
+
+    # Personal vocabulary: whole-word replacements applied to transcribed
+    # text, case-insensitive, e.g. {"herder": "herdr"}
+    word_replacements: dict = field(default_factory=dict)
 
     # Language (for models that support it, e.g. Canary)
     language: str = "en"
@@ -256,6 +261,33 @@ def filter_fillers(text: str) -> str:
     text = _FILLER_RE.sub("", text)
     text = _MULTI_SPACE_RE.sub(" ", text).strip()
     return text
+
+
+# ---------------------------------------------------------------------------
+# Word replacements (personal vocabulary)
+# ---------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=4)
+def _word_re(words: tuple[str, ...]) -> re.Pattern:
+    # Longest-first so "note book" wins over "note" when both are keys.
+    alts = "|".join(re.escape(w) for w in sorted(words, key=len, reverse=True))
+    return re.compile(rf"\b(?:{alts})\b", re.IGNORECASE)
+
+
+def apply_word_replacements(text: str, mapping: dict) -> str:
+    """Replace whole words case-insensitively, keeping a leading capital."""
+    if not mapping or not text:
+        return text
+    lower = {k.lower(): v for k, v in mapping.items()}
+
+    def _sub(m: re.Match) -> str:
+        rep = lower[m.group(0).lower()]
+        if rep and m.group(0)[0].isupper():
+            return rep[0].upper() + rep[1:]
+        return rep
+
+    return _word_re(tuple(sorted(lower))).sub(_sub, text)
 
 
 # ---------------------------------------------------------------------------
@@ -992,9 +1024,13 @@ class DictationController:
         if new_config.model_profile != old_profile or was_running:
             self._rebuild_engine()
 
-    def _on_final_text(self, text: str):
+    def _postprocess(self, text: str) -> str:
         if self._config.filter_fillers:
             text = filter_fillers(text)
+        return apply_word_replacements(text, self._config.word_replacements)
+
+    def _on_final_text(self, text: str):
+        text = self._postprocess(text)
         if not text:
             return
         self._typer.type_text(text)
@@ -1003,15 +1039,13 @@ class DictationController:
 
     def _on_partial_type(self, text: str):
         """Type a streaming partial into the active window (overwrite prev)."""
-        if self._config.filter_fillers:
-            text = filter_fillers(text)
+        text = self._postprocess(text)
         if text:
             self._typer.type_partial(text)
 
     def _on_commit_partial(self, text: str):
         """Commit the streaming partial as final text."""
-        if self._config.filter_fillers:
-            text = filter_fillers(text)
+        text = self._postprocess(text)
         self._typer.commit_partial(text)
         if self._status_callback:
             self._status_callback("")
@@ -1803,6 +1837,21 @@ class SettingsDialog(Gtk.Dialog):
         self._filter_fillers_check.set_active(self._config.filter_fillers)
         box.pack_start(self._filter_fillers_check, False, False, 4)
 
+        repl_label = Gtk.Label(label="Word replacements (one per line, spoken=typed):",
+                               xalign=0)
+        box.pack_start(repl_label, False, False, 0)
+        self._repl_view = Gtk.TextView()
+        self._repl_view.set_tooltip_text(
+            "Whole-word, case-insensitive replacements applied to transcribed "
+            "text.  Example line:  herder=herdr")
+        self._repl_view.get_buffer().set_text(
+            "\n".join(f"{k}={v}" for k, v in self._config.word_replacements.items()))
+        repl_scroll = Gtk.ScrolledWindow()
+        repl_scroll.set_min_content_height(70)
+        repl_scroll.set_shadow_type(Gtk.ShadowType.IN)
+        repl_scroll.add(self._repl_view)
+        box.pack_start(repl_scroll, False, False, 4)
+
         # Night mode
         sep = Gtk.Separator()
         sep.set_margin_top(8)
@@ -1842,6 +1891,13 @@ class SettingsDialog(Gtk.Dialog):
         self._config.pause_secs = self._pause_spin.get_value()
         self._config.partial_overwrite = self._partial_overwrite_check.get_active()
         self._config.filter_fillers = self._filter_fillers_check.get_active()
+        buf = self._repl_view.get_buffer()
+        raw = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+        self._config.word_replacements = {
+            k.strip(): v.strip()
+            for k, _, v in (line.partition("=") for line in raw.splitlines())
+            if k.strip() and v.strip()
+        }
         self._config.night_mode = self._night_check.get_active()
         self._config.night_start = int(self._night_start_spin.get_value())
         self._config.night_end = int(self._night_end_spin.get_value())
