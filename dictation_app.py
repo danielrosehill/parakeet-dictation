@@ -761,6 +761,10 @@ class ASREngine:
         self._stop_event.clear()
         self._pause_event.set()
         self._paused = False
+        # Set before the thread runs: toggle() must see "running" the
+        # moment start() returns, or a second hotkey fire during init
+        # starts a second capture thread instead of stopping this one.
+        self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -798,11 +802,11 @@ class ASREngine:
         try:
             self._ensure_models()
         except Exception as e:
+            self._running = False
             GLib.idle_add(self._on_error, str(e))
             return
 
         is_streaming = self._profile.get("streaming", False)
-        self._running = True
 
         try:
             if is_streaming:
@@ -1073,6 +1077,28 @@ class HotkeyManager:
         self._on_pause = on_pause
         self._listener = None
 
+    @staticmethod
+    def _debounce(fn, gap: float = 1.0):
+        """One activation per hotkey press, however long it is held.
+
+        X11 auto-repeat re-delivers a held key as release+press pulses
+        (~33/s after a ~0.5s delay) and pynput re-activates on every
+        pulse — each re-fire toggled dictation off right after it
+        started.  Fire only when the previous pulse is at least *gap*
+        old; every suppressed pulse re-arms the window, so pulses 30ms
+        apart never fire no matter how long the key is held.
+        """
+        last = [None]
+
+        def wrapper():
+            now = time.monotonic()
+            prev = last[0]
+            last[0] = now
+            if prev is None or now - prev >= gap:
+                fn()
+
+        return wrapper
+
     def start(self):
         from pynput import keyboard
         bindings = {}
@@ -1085,6 +1111,7 @@ class HotkeyManager:
         if self._config.hotkey_pause:
             bindings[self._config.hotkey_pause] = lambda: GLib.idle_add(self._on_pause)
 
+        bindings = {key: self._debounce(fn) for key, fn in bindings.items()}
         self._listener = keyboard.GlobalHotKeys(bindings)
         self._listener.daemon = True
         self._listener.start()
