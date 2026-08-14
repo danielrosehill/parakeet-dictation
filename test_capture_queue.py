@@ -25,9 +25,13 @@ class FakeInputStream:
     def __init__(self, *_, callback=None, **kw):
         self._callback = callback
         self.produced = []
+        self.active = False
 
-    def __enter__(self):
+    def start(self):
+        self.active = True
+
         def _produce():
+            time.sleep(0.05)  # let _begin_capture flip routing first
             for n in range(N_CHUNKS):
                 data = np.arange(n * CHUNK, (n + 1) * CHUNK,
                                  dtype=np.float32).reshape(-1, 1)
@@ -36,11 +40,9 @@ class FakeInputStream:
                 time.sleep(0.002)
         self._thread = threading.Thread(target=_produce, daemon=True)
         self._thread.start()
-        return self
 
-    def __exit__(self, *exc):
-        self._thread.join(timeout=5)
-        return False
+    def close(self):
+        self.active = False
 
 
 class RecordingVad:

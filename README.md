@@ -152,6 +152,11 @@ Choose your input device from:
 
 Leave set to "System Default" to use your desktop's default input device.
 
+The input stream stays open while the app runs (your desktop may show a
+mic-in-use indicator). While idle, only the last 0.5 seconds is kept in
+memory; nothing is transcribed or stored. That half-second is included
+when you press the hotkey, so your first words are never clipped.
+
 ### Model manager
 
 Open **Settings > Models** to browse available model profiles, download them in-app, and select which one to use.

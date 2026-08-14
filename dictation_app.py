@@ -43,6 +43,9 @@ DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"
 MODELS_DIR = DATA_DIR / "models"
 MODELS_JSON = APP_DIR / "models.json"
 SAMPLE_RATE = 16000
+CHUNK_SECS = 0.1  # mic callback granularity
+CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_SECS)
+PREROLL_SECS = 0.5  # pre-press audio spliced into a new session
 
 
 def _migrate_legacy_models():
@@ -625,6 +628,20 @@ class ASREngine:
         # the hotkey press and the mic opening, eating the first sentence.
         self._recognizer = None
         self._recognizer_lock = threading.Lock()
+        # Persistent mic: opened once (in _warm) and never closed between
+        # sessions — opening the stream per press cost 100-300 ms of lost
+        # speech.  While idle the callback keeps the newest PREROLL_SECS
+        # in a ring; _begin_capture splices that in front of the live
+        # queue, so words spoken at (or just before) the hotkey press
+        # are transcribed too.
+        self._mic_stream = None
+        self._mic_dev = None
+        self._mic_lock = threading.Lock()
+        self._route_lock = threading.Lock()
+        self._capturing = False
+        self._audio_q: queue.Queue = queue.Queue()
+        self._preroll_ring: deque = deque(
+            maxlen=max(1, int(PREROLL_SECS / CHUNK_SECS)))
         threading.Thread(target=self._warm, daemon=True).start()
 
     def _get_recognizer(self):
@@ -637,6 +654,12 @@ class ASREngine:
             return self._recognizer
 
     def _warm(self):
+        try:
+            # Mic first: the stream must be live before any model work so
+            # the ring holds audio from the moment the app starts.
+            self._ensure_mic()
+        except Exception:
+            pass  # no input device — reported when dictation starts
         try:
             self._ensure_models()
             recognizer = self._get_recognizer()
@@ -816,26 +839,65 @@ class ASREngine:
             self._running = False
             play_beep_stop(self._config)
 
-    def _open_mic(self, samples_per_chunk):
-        """Mic via the PortAudio callback into an unbounded queue.
+    def _on_audio(self, indata, _frames, _time, _status):
+        """PortAudio callback — never blocked by decoding; the queue
+        absorbs any backlog.  (The blocking read() path held only ~0.4s
+        and dropped overrun silently, eating the words after a decode
+        stall.)  The lock only guards routing flips; it is held for
+        microseconds."""
+        chunk = indata.reshape(-1).copy()
+        with self._route_lock:
+            if self._capturing:
+                self._audio_q.put(chunk)
+            else:
+                self._preroll_ring.append(chunk)
 
-        The blocking read() path holds only ~0.4s of audio and discards
-        overrun WITHOUT setting the overflowed flag, so any decode stall
-        longer than that silently ate the next words spoken — the classic
-        "first sentence after a pause is missing".  The callback thread is
-        never blocked by decoding, and the queue absorbs any backlog.
-        """
-        audio_q: queue.Queue = queue.Queue()
+    def _ensure_mic(self):
+        """Open the persistent input stream; reopen on device change."""
+        with self._mic_lock:
+            device = resolve_audio_device(self._config.audio_device)
+            if self._mic_stream is not None:
+                if self._mic_dev == device and self._mic_stream.active:
+                    return
+                try:
+                    self._mic_stream.close()
+                except Exception:
+                    pass
+                self._mic_stream = None
+            stream = sd.InputStream(
+                device=device, channels=1, dtype="float32",
+                samplerate=SAMPLE_RATE, blocksize=CHUNK_SAMPLES,
+                callback=self._on_audio,
+            )
+            stream.start()
+            self._mic_stream = stream
+            self._mic_dev = device
 
-        def _on_audio(indata, _frames, _time, _status):
-            audio_q.put(indata.reshape(-1).copy())
+    def _begin_capture(self) -> queue.Queue:
+        """Route mic audio into a fresh queue, pre-press ring first."""
+        self._ensure_mic()
+        q: queue.Queue = queue.Queue()
+        with self._route_lock:
+            while self._preroll_ring:
+                q.put(self._preroll_ring.popleft())
+            self._audio_q = q
+            self._capturing = True
+        return q
 
-        device = resolve_audio_device(self._config.audio_device)
-        stream = sd.InputStream(
-            device=device, channels=1, dtype="float32", samplerate=SAMPLE_RATE,
-            blocksize=samples_per_chunk, callback=_on_audio,
-        )
-        return stream, audio_q
+    def _end_capture(self):
+        with self._route_lock:
+            self._capturing = False
+
+    def close(self):
+        """Release the mic — call before dropping the engine."""
+        self.stop()
+        with self._mic_lock:
+            if self._mic_stream is not None:
+                try:
+                    self._mic_stream.close()
+                except Exception:
+                    pass
+                self._mic_stream = None
 
     def _drain(self, audio_q) -> list:
         """Pop everything currently queued (used for pause/stop)."""
@@ -858,15 +920,14 @@ class ASREngine:
             vad.pop()
 
     def _run_offline(self):
-        recognizer = self._get_recognizer()
-        vad = self._build_vad()
-        chunk_duration = 0.1
-        samples_per_chunk = int(SAMPLE_RATE * chunk_duration)
-
-        stream, audio_q = self._open_mic(samples_per_chunk)
-        with stream:
+        audio_q = self._begin_capture()
+        try:
             play_beep_start(self._config)
             GLib.idle_add(self._on_partial, "")
+            # Fetched after capture starts: a cold model load (seconds)
+            # then delays the first text, but loses no audio.
+            recognizer = self._get_recognizer()
+            vad = self._build_vad()
 
             while not self._stop_event.is_set():
                 self._pause_event.wait(timeout=0.1)
@@ -888,22 +949,22 @@ class ASREngine:
                 self._decode_pending(recognizer, vad)
 
             # Feed audio captured but not yet consumed, then flush
+            self._end_capture()
             for audio in self._drain(audio_q):
                 vad.accept_waveform(audio.tolist())
             vad.flush()
             self._decode_pending(recognizer, vad)
+        finally:
+            self._end_capture()
 
     def _run_streaming(self):
-        recognizer = self._get_recognizer()
-        stream = recognizer.create_stream()
-        chunk_duration = 0.1
-        samples_per_chunk = int(SAMPLE_RATE * chunk_duration)
-        partial_overwrite = self._config.partial_overwrite
-
-        mic, audio_q = self._open_mic(samples_per_chunk)
-        with mic:
+        audio_q = self._begin_capture()
+        try:
             play_beep_start(self._config)
             GLib.idle_add(self._on_partial, "")
+            recognizer = self._get_recognizer()
+            stream = recognizer.create_stream()
+            partial_overwrite = self._config.partial_overwrite
 
             while not self._stop_event.is_set():
                 self._pause_event.wait(timeout=0.1)
@@ -938,6 +999,8 @@ class ASREngine:
                         else:
                             GLib.idle_add(self._on_text, text)
                     recognizer.reset(stream)
+        finally:
+            self._end_capture()
 
 
 # ---------------------------------------------------------------------------
@@ -954,6 +1017,8 @@ class DictationController:
         self._rebuild_engine()
 
     def _rebuild_engine(self):
+        if self._engine is not None:
+            self._engine.close()  # release the persistent mic before swapping
         profile = self._profiles_data["profiles"].get(self._config.model_profile)
         if not profile:
             profile = self._profiles_data["profiles"]["desktop"]
