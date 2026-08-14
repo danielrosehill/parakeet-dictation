@@ -35,7 +35,12 @@
       "description": "Lightweight, 4 languages (EN/ES/DE/FR). ~198 MB download, ~500 MB RAM.",
       "recommended_for": "Laptops and low-RAM machines",
       "hardware_label": "CPU",
-      "languages": ["en", "es", "de", "fr"],
+      "languages": [
+        "en",
+        "es",
+        "de",
+        "fr"
+      ],
       "params": "180M",
       "size_mb": 198,
       "streaming": false,
@@ -88,9 +93,5 @@
         }
       }
     }
-  },
-  "vad": {
-    "filename": "silero_vad.onnx",
-    "url": "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx"
   }
 }

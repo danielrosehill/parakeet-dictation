@@ -2,7 +2,7 @@
 """Download model files for Parakeet Dictation.
 
 Usage:
-    python download_models.py              # download default (desktop) profile + VAD
+    python download_models.py              # download default (desktop) profile
     python download_models.py desktop      # download desktop profile
     python download_models.py laptop       # download laptop profile
     python download_models.py streaming    # download streaming profile
@@ -34,16 +34,6 @@ def download_file(url: str, dest: Path):
         for chunk in resp.iter_content(chunk_size=1024 * 1024):
             f.write(chunk)
             bar.update(len(chunk))
-
-
-def download_vad(config: dict):
-    vad = config["vad"]
-    dest = MODELS_DIR / vad["filename"]
-    if dest.exists() and dest.stat().st_size > 0:
-        print(f"  {vad['filename']} already exists.")
-        return
-    print(f"Downloading VAD model...")
-    download_file(vad["url"], dest)
 
 
 def download_profile(config: dict, profile_id: str):

@@ -47,8 +47,6 @@ SAMPLE_RATE = 16000
 
 def _migrate_legacy_models():
     """Move models from APP_DIR/models to the XDG data directory if needed."""
-    import shutil
-
     legacy = APP_DIR / "models"
     if not legacy.is_dir() or legacy == MODELS_DIR:
         return
@@ -66,8 +64,6 @@ def _migrate_legacy_models():
             else:
                 shutil.copy2(str(item), str(dest))
 
-
-_migrate_legacy_models()
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -139,8 +135,9 @@ class AppConfig:
                     k: v for k, v in data.items()
                     if k in AppConfig.__dataclass_fields__
                 })
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"WARNING: ignoring bad config {CONFIG_FILE}: {e}",
+                      file=sys.stderr)
         return AppConfig()
 
 
@@ -175,17 +172,15 @@ def _is_night_mode(config: "AppConfig") -> bool:
         return config.night_start <= hour < config.night_end
 
 
-# Global config ref for beep functions (set in main)
-_active_config: "AppConfig | None" = None
-
 # canberra-gtk-play plays named events from the user's desktop sound theme,
 # honoring the theme choice and alert volume in system Settings -> Sound.
 _CANBERRA = shutil.which("canberra-gtk-play")
 
 
-def _play_event(event_id: str, volume: float, fallback_tone) -> None:
+def _play_event(event_id: str, config: AppConfig, fallback_tone) -> None:
     """Play an XDG sound-theme event; sine-tone fallback without canberra."""
-    if volume <= 0 or (_active_config and _is_night_mode(_active_config)):
+    volume = config.beep_volume
+    if volume <= 0 or _is_night_mode(config):
         return
     if _CANBERRA:
         # Beep-volume slider becomes attenuation relative to the alert volume
@@ -197,26 +192,26 @@ def _play_event(event_id: str, volume: float, fallback_tone) -> None:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
     else:
-        sd.play(fallback_tone(), samplerate=SAMPLE_RATE)
+        sd.play(fallback_tone(volume), samplerate=SAMPLE_RATE)
 
 
-def play_beep_start(volume: float = 0.5):
+def play_beep_start(config: AppConfig):
     """Dictation started — theme 'device-added' sound (rising tone fallback)."""
-    _play_event("device-added", volume, lambda: _generate_tone(880, 0.15, volume))
+    _play_event("device-added", config, lambda v: _generate_tone(880, 0.15, v))
 
 
-def play_beep_stop(volume: float = 0.5):
+def play_beep_stop(config: AppConfig):
     """Dictation stopped — theme 'device-removed' sound (falling tone fallback)."""
-    _play_event("device-removed", volume, lambda: _generate_tone(440, 0.15, volume))
+    _play_event("device-removed", config, lambda v: _generate_tone(440, 0.15, v))
 
 
-def play_beep_pause(volume: float = 0.5):
+def play_beep_pause(config: AppConfig):
     """Paused/resumed — theme 'message' sound (double beep fallback)."""
-    def double_beep():
+    def double_beep(volume):
         t = _generate_tone(660, 0.07, volume)
         gap = np.zeros(int(SAMPLE_RATE * 0.05), dtype=np.float32)
         return np.concatenate([t, gap, t])
-    _play_event("message", volume, double_beep)
+    _play_event("message", config, double_beep)
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +251,7 @@ _FILLER_RE = re.compile(
 _MULTI_SPACE_RE = re.compile(r"  +")
 
 
-def filter_fillers(text: str) -> str:
+def strip_fillers(text: str) -> str:
     """Remove common filler words, collapse resulting double-spaces."""
     text = _FILLER_RE.sub("", text)
     text = _MULTI_SPACE_RE.sub(" ", text).strip()
@@ -367,6 +362,8 @@ class TextTyper:
 
     def _type_raw(self, text: str):
         """Type a string into the active window (no newline safety)."""
+        # ponytail: if/elif on self._method here, in _send_backspaces and in
+        # __init__ — switch to per-method strategy objects if a 5th typer lands
         try:
             if self._method == "wtype":
                 subprocess.run(["wtype", "--", text], timeout=5)
@@ -784,18 +781,18 @@ class ASREngine:
         if seq == self._partial_seq:
             self._on_partial_type(text)
 
-    def pause(self):
+    def toggle_pause(self):
         if not self._running:
             return
         if self._paused:
             self._paused = False
             self._pause_event.set()
-            play_beep_pause(self._config.beep_volume)
+            play_beep_pause(self._config)
             GLib.idle_add(self._on_partial, "Resumed")
         else:
             self._paused = True
             self._pause_event.clear()
-            play_beep_pause(self._config.beep_volume)
+            play_beep_pause(self._config)
             GLib.idle_add(self._on_partial, "Paused")
 
     def _run(self):
@@ -817,7 +814,7 @@ class ASREngine:
             GLib.idle_add(self._on_error, str(e))
         finally:
             self._running = False
-            play_beep_stop(self._config.beep_volume)
+            play_beep_stop(self._config)
 
     def _open_mic(self, samples_per_chunk):
         """Mic via the PortAudio callback into an unbounded queue.
@@ -849,6 +846,17 @@ class ASREngine:
             except queue.Empty:
                 return chunks
 
+    def _decode_pending(self, recognizer, vad):
+        """Transcribe every completed VAD segment and emit its text."""
+        while not vad.empty():
+            s = recognizer.create_stream()
+            s.accept_waveform(SAMPLE_RATE, vad.front.samples)
+            recognizer.decode_stream(s)
+            text = s.result.text.strip()
+            if text:
+                GLib.idle_add(self._on_text, text)
+            vad.pop()
+
     def _run_offline(self):
         recognizer = self._get_recognizer()
         vad = self._build_vad()
@@ -857,7 +865,7 @@ class ASREngine:
 
         stream, audio_q = self._open_mic(samples_per_chunk)
         with stream:
-            play_beep_start(self._config.beep_volume)
+            play_beep_start(self._config)
             GLib.idle_add(self._on_partial, "")
 
             while not self._stop_event.is_set():
@@ -877,29 +885,13 @@ class ASREngine:
                 if vad.is_speech_detected():
                     GLib.idle_add(self._on_partial, "Listening...")
 
-                while not vad.empty():
-                    segment = vad.front
-                    s = recognizer.create_stream()
-                    s.accept_waveform(SAMPLE_RATE, segment.samples)
-                    recognizer.decode_stream(s)
-                    text = s.result.text.strip()
-                    if text:
-                        GLib.idle_add(self._on_text, text)
-                    vad.pop()
+                self._decode_pending(recognizer, vad)
 
             # Feed audio captured but not yet consumed, then flush
             for audio in self._drain(audio_q):
                 vad.accept_waveform(audio.tolist())
             vad.flush()
-            while not vad.empty():
-                segment = vad.front
-                s = recognizer.create_stream()
-                s.accept_waveform(SAMPLE_RATE, segment.samples)
-                recognizer.decode_stream(s)
-                text = s.result.text.strip()
-                if text:
-                    GLib.idle_add(self._on_text, text)
-                vad.pop()
+            self._decode_pending(recognizer, vad)
 
     def _run_streaming(self):
         recognizer = self._get_recognizer()
@@ -910,7 +902,7 @@ class ASREngine:
 
         mic, audio_q = self._open_mic(samples_per_chunk)
         with mic:
-            play_beep_start(self._config.beep_volume)
+            play_beep_start(self._config)
             GLib.idle_add(self._on_partial, "")
 
             while not self._stop_event.is_set():
@@ -965,6 +957,9 @@ class DictationController:
         profile = self._profiles_data["profiles"].get(self._config.model_profile)
         if not profile:
             profile = self._profiles_data["profiles"]["desktop"]
+        # Callers mutate the shared config object before apply_config, so a
+        # change can only be detected against the profile the engine holds.
+        self._engine_profile = self._config.model_profile
         self._engine = ASREngine(
             self._config, profile,
             on_text=self._on_final_text,
@@ -976,7 +971,6 @@ class DictationController:
 
     def set_status_callback(self, cb):
         self._status_callback = cb
-
 
     @property
     def is_running(self) -> bool:
@@ -1014,23 +1008,26 @@ class DictationController:
         else:
             self.start()
 
-    def pause(self):
-        self._engine.pause()
+    def toggle_pause(self):
+        self._engine.toggle_pause()
+
+    def switch_model(self, model_id: str):
+        self._config.model_profile = model_id
+        self.apply_config(self._config)
 
     def apply_config(self, new_config: AppConfig):
         was_running = self._engine.is_running
         if was_running:
             self._engine.stop()
-        old_profile = self._config.model_profile
         self._config = new_config
         self._config.save()
         self._typer = TextTyper(new_config.typer)
-        if new_config.model_profile != old_profile or was_running:
+        if new_config.model_profile != self._engine_profile or was_running:
             self._rebuild_engine()
 
     def _postprocess(self, text: str) -> str:
         if self._config.filter_fillers:
-            text = filter_fillers(text)
+            text = strip_fillers(text)
         return apply_word_replacements(text, self._config.word_replacements)
 
     def _on_final_text(self, text: str):
@@ -1252,100 +1249,36 @@ def _download_file(url: str, dest: Path, on_progress_bytes=None):
         raise
 
 
-def _ensure_vad(profiles_data: dict, on_progress_bytes=None):
-    """Download the VAD model if not present."""
-    vad = profiles_data.get("vad")
-    if not vad:
-        return
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    dest = MODELS_DIR / vad["filename"]
-    if dest.exists() and dest.stat().st_size > 0:
-        return
-    _download_file(vad["url"], dest, on_progress_bytes)
-
-
-def _download_model(model_id: str, profiles_data: dict, on_progress, on_done):
-    """Download a model in a background thread."""
+def _download_models(model_ids: list, profiles_data: dict, on_progress, on_done):
+    """Download the given models sequentially in a background thread."""
 
     def _worker():
         try:
-            profile = profiles_data["profiles"][model_id]
-            model_dir = MODELS_DIR / model_id
-            model_dir.mkdir(parents=True, exist_ok=True)
-
-            # Download VAD first
-            def _vad_progress(done, total):
-                if total:
-                    mb = done / 1024 / 1024
-                    total_mb = total / 1024 / 1024
-                    GLib.idle_add(on_progress, f"VAD: {mb:.0f}/{total_mb:.0f} MB", -1.0)
-            _ensure_vad(profiles_data, _vad_progress)
-
-            # Download model files
-            files = profile["files"]
-            total_files = len(files)
-            for i, (key, info) in enumerate(files.items(), 1):
-                dest = model_dir / info["filename"]
-                if dest.exists() and dest.stat().st_size > 0:
-                    continue
-
-                def _file_progress(done, total, fname=info["filename"], idx=i):
-                    if total:
-                        frac = done / total
-                        mb = done / 1024 / 1024
-                        total_mb = total / 1024 / 1024
-                        GLib.idle_add(
-                            on_progress,
-                            f"{fname} ({idx}/{total_files}): {mb:.0f}/{total_mb:.0f} MB",
-                            frac,
-                        )
-                    else:
-                        mb = done / 1024 / 1024
-                        GLib.idle_add(on_progress, f"{fname}: {mb:.0f} MB", -1.0)
-
-                _download_file(info["url"], dest, _file_progress)
-
-            GLib.idle_add(on_done, True, "")
-        except Exception as e:
-            GLib.idle_add(on_done, False, str(e))
-
-    threading.Thread(target=_worker, daemon=True).start()
-
-
-def _download_all_models(profiles_data: dict, on_progress, on_done):
-    """Download all models sequentially in a background thread."""
-
-    def _worker():
-        try:
-            # Download VAD first
-            def _vad_progress(done, total):
-                if total:
-                    mb = done / 1024 / 1024
-                    total_mb = total / 1024 / 1024
-                    GLib.idle_add(on_progress, f"VAD: {mb:.0f}/{total_mb:.0f} MB", -1.0)
-            _ensure_vad(profiles_data, _vad_progress)
-
             profiles = profiles_data["profiles"]
-            for mid, profile in profiles.items():
+            for mid in model_ids:
+                profile = profiles[mid]
                 model_dir = MODELS_DIR / mid
                 model_dir.mkdir(parents=True, exist_ok=True)
                 files = profile["files"]
                 total_files = len(files)
-                for i, (key, info) in enumerate(files.items(), 1):
+                prefix = f"{profile['name'][:18]}: " if len(model_ids) > 1 else ""
+                for i, info in enumerate(files.values(), 1):
                     dest = model_dir / info["filename"]
                     if dest.exists() and dest.stat().st_size > 0:
                         continue
-                    short_name = profile["name"][:18]
 
-                    def _file_progress(done, total, sn=short_name, fname=info["filename"], idx=i, tf=total_files):
+                    def _file_progress(done, total, p=prefix,
+                                       fname=info["filename"], idx=i):
+                        mb = done / 1024 / 1024
                         if total:
-                            frac = done / total
-                            mb = done / 1024 / 1024
-                            total_mb = total / 1024 / 1024
-                            GLib.idle_add(on_progress, f"{sn}: {fname} {mb:.0f}/{total_mb:.0f} MB", frac)
+                            GLib.idle_add(
+                                on_progress,
+                                f"{p}{fname} ({idx}/{total_files}): "
+                                f"{mb:.0f}/{total / 1024 / 1024:.0f} MB",
+                                done / total,
+                            )
                         else:
-                            mb = done / 1024 / 1024
-                            GLib.idle_add(on_progress, f"{sn}: {fname} {mb:.0f} MB", -1.0)
+                            GLib.idle_add(on_progress, f"{p}{fname}: {mb:.0f} MB", -1.0)
 
                     _download_file(info["url"], dest, _file_progress)
             GLib.idle_add(on_done, True, "")
@@ -1466,7 +1399,8 @@ class WelcomeDialog(Gtk.Dialog):
                 self._error_label.show()
                 print(f"Download error: {err}", file=sys.stderr)
 
-        _download_all_models(self._profiles_data, on_progress, on_done)
+        _download_models(list(self._profiles), self._profiles_data,
+                         on_progress, on_done)
 
 
 class SettingsDialog(Gtk.Dialog):
@@ -1657,7 +1591,7 @@ class SettingsDialog(Gtk.Dialog):
                 self._dl_error.show()
                 print(f"Download error: {err}", file=sys.stderr)
 
-        _download_model(model_id, self._profiles_data, on_progress, on_done)
+        _download_models([model_id], self._profiles_data, on_progress, on_done)
 
     def _on_download_all(self, _btn):
         self._dl_all_btn.set_sensitive(False)
@@ -1678,7 +1612,8 @@ class SettingsDialog(Gtk.Dialog):
                 self._dl_error.show()
                 print(f"Download error: {err}", file=sys.stderr)
 
-        _download_all_models(self._profiles_data, on_progress, on_done)
+        _download_models(list(self._profiles), self._profiles_data,
+                         on_progress, on_done)
 
     # --- Hotkeys tab ---
 
@@ -1908,7 +1843,6 @@ class SettingsDialog(Gtk.Dialog):
         return box
 
     def _save_general(self, _btn):
-        global _active_config
         self._config.audio_device = self._mic_combo.get_active_id() or ""
         self._config.typer = self._typer_combo.get_active_id() or "wtype"
         self._config.beep_volume = self._vol_scale.get_value()
@@ -1928,7 +1862,6 @@ class SettingsDialog(Gtk.Dialog):
         self._config.night_mode = self._night_check.get_active()
         self._config.night_start = int(self._night_start_spin.get_value())
         self._config.night_end = int(self._night_end_spin.get_value())
-        _active_config = self._config
         self._config.save()
         if self._on_save:
             self._on_save(self._config)
@@ -1987,10 +1920,10 @@ class SettingsDialog(Gtk.Dialog):
 # ---------------------------------------------------------------------------
 
 class MainWindow(Gtk.Window):
-    def __init__(self, controller: DictationController, hotkey_mgr: HotkeyManager):
+    def __init__(self, controller: DictationController):
         super().__init__(title=APP_NAME)
         self._controller = controller
-        self._hotkey_mgr = hotkey_mgr
+        self.tray_refresh = lambda: None  # set by main once the tray exists
         self.set_default_size(480, -1)
         self.set_resizable(False)
         self.set_icon_name("audio-input-microphone")
@@ -2020,7 +1953,7 @@ class MainWindow(Gtk.Window):
 
         self._pause_btn = Gtk.Button(label="Pause")
         self._pause_btn.set_sensitive(False)
-        self._pause_btn.connect("clicked", lambda _: self._controller.pause())
+        self._pause_btn.connect("clicked", lambda _: self._controller.toggle_pause())
         btn_box.pack_start(self._pause_btn, False, False, 0)
 
         vbox.pack_start(btn_box, False, False, 0)
@@ -2093,10 +2026,7 @@ class MainWindow(Gtk.Window):
         if not _is_model_downloaded(model_id, self._controller.profiles):
             self._model_combo.set_active_id(self._controller.config.model_profile)
             return
-        new_config = self._controller.config
-        new_config.model_profile = model_id
-        self._controller.apply_config(new_config)
-        self._hotkey_mgr.rebuild(new_config)
+        self._controller.switch_model(model_id)
         # Keep streaming checkbox in sync
         is_streaming = self._controller.profiles.get(model_id, {}).get("streaming", False)
         self._streaming_check.handler_block_by_func(self._on_streaming_toggled)
@@ -2104,9 +2034,7 @@ class MainWindow(Gtk.Window):
         self._streaming_check.handler_unblock_by_func(self._on_streaming_toggled)
         if not is_streaming:
             self._non_streaming_model = model_id
-        if hasattr(self, "_tray") and self._tray:
-            self._tray._build_menu()
-            self._tray.update_ui()
+        self.tray_refresh()
 
     def _on_streaming_toggled(self, check):
         if check.get_active():
@@ -2127,15 +2055,10 @@ class MainWindow(Gtk.Window):
             check.handler_unblock_by_func(self._on_streaming_toggled)
             return
 
-        new_config = self._controller.config
-        new_config.model_profile = target
-        self._controller.apply_config(new_config)
-        self._hotkey_mgr.rebuild(new_config)
+        self._controller.switch_model(target)
         # Sync the model combo
         self._model_combo.set_active_id(target)
-        if hasattr(self, "_tray") and self._tray:
-            self._tray._build_menu()
-            self._tray.update_ui()
+        self.tray_refresh()
 
     def _update_controls(self):
         running = self._controller.is_running
@@ -2209,7 +2132,7 @@ class TrayIcon:
         menu.append(self._toggle_item)
 
         self._pause_item = Gtk.MenuItem(label=f"Pause ({cfg.hotkey_pause})")
-        self._pause_item.connect("activate", lambda _: self._controller.pause())
+        self._pause_item.connect("activate", lambda _: self._controller.toggle_pause())
         self._pause_item.set_sensitive(False)
         menu.append(self._pause_item)
 
@@ -2256,13 +2179,14 @@ class TrayIcon:
         menu.show_all()
         self._indicator.set_menu(menu)
 
-    def _on_switch_model(self, _item, model_id):
-        new_config = self._controller.config
-        new_config.model_profile = model_id
-        self._controller.apply_config(new_config)
-        self._hotkey_mgr.rebuild(new_config)
+    def refresh(self):
+        """Rebuild the menu and re-sync labels/icon after a model change."""
         self._build_menu()
         self.update_ui()
+
+    def _on_switch_model(self, _item, model_id):
+        self._controller.switch_model(model_id)
+        self.refresh()
 
     def _on_toggle(self, _item=None):
         self._controller.toggle()
@@ -2311,8 +2235,7 @@ class TrayIcon:
     def _apply_settings(self, new_config: AppConfig):
         self._controller.apply_config(new_config)
         self._hotkey_mgr.rebuild(new_config)
-        self._build_menu()
-        self.update_ui()
+        self.refresh()
 
     def _on_quit(self, _item):
         self._controller.stop()
@@ -2324,9 +2247,8 @@ class TrayIcon:
 # ---------------------------------------------------------------------------
 
 def main():
-    global _active_config
+    _migrate_legacy_models()
     config = AppConfig.load()
-    _active_config = config
 
     # Ensure typer is a valid method
     if config.typer not in ("xdotool", "clipboard", "wtype", "ydotool"):
@@ -2342,13 +2264,13 @@ def main():
         on_toggle=lambda: (controller.toggle(), tray and tray.update_ui()),
         on_start=lambda: (controller.start(), tray and tray.update_ui()),
         on_stop=lambda: (controller.stop(), tray and tray.update_ui()),
-        on_pause=lambda: controller.pause(),
+        on_pause=lambda: controller.toggle_pause(),
     )
 
-    main_window = MainWindow(controller, hotkey_mgr)
+    main_window = MainWindow(controller)
 
     tray = TrayIcon(controller, hotkey_mgr, main_window)
-    main_window._tray = tray  # So model changes from window rebuild tray menu
+    main_window.tray_refresh = tray.refresh
     hotkey_mgr.start()
 
     signal.signal(signal.SIGINT, lambda *_: (controller.stop(), Gtk.main_quit()))
@@ -2359,8 +2281,7 @@ def main():
         def _on_model_ready(new_config):
             controller.apply_config(new_config)
             hotkey_mgr.rebuild(new_config)
-            tray._build_menu()
-            tray.update_ui()
+            tray.refresh()
         WelcomeDialog(profiles_data, config, _on_model_ready)
 
     profile_name = controller.profiles.get(
