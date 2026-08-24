@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import wave
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
@@ -46,6 +47,36 @@ SAMPLE_RATE = 16000
 CHUNK_SECS = 0.1  # mic callback granularity
 CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_SECS)
 PREROLL_SECS = 0.5  # pre-press audio spliced into a new session
+HISTORY_FILE = DATA_DIR / "history.log"
+LAST_SESSION_WAV = DATA_DIR / "last-session.wav"
+
+
+def log_history(line: str) -> None:
+    """Append a timestamped line to the dictation history log."""
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(HISTORY_FILE, "a") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {line}\n")
+    except OSError:
+        pass
+
+
+def save_session_wav(chunks) -> None:
+    """Write the session's mic audio to LAST_SESSION_WAV — ground truth
+    for 'did it hear me'.  Overwritten each session."""
+    if not chunks:
+        return
+    try:
+        audio = np.concatenate(list(chunks))
+        pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(LAST_SESSION_WAV), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(SAMPLE_RATE)
+            w.writeframes(pcm.tobytes())
+    except Exception as e:
+        print(f"WARNING: could not save session audio: {e}", file=sys.stderr)
 
 
 def _migrate_legacy_models():
@@ -921,6 +952,9 @@ class ASREngine:
 
     def _run_offline(self):
         audio_q = self._begin_capture()
+        # ponytail: keeps last 10 min in RAM (~37 MB); ring covers any session
+        session = deque(maxlen=int(600 / CHUNK_SECS))
+        log_history("--- session start ---")
         try:
             play_beep_start(self._config)
             GLib.idle_add(self._on_partial, "")
@@ -941,6 +975,7 @@ class ASREngine:
                     audio = audio_q.get(timeout=0.1)
                 except queue.Empty:
                     continue
+                session.append(audio)
                 vad.accept_waveform(audio.tolist())
 
                 if vad.is_speech_detected():
@@ -951,14 +986,20 @@ class ASREngine:
             # Feed audio captured but not yet consumed, then flush
             self._end_capture()
             for audio in self._drain(audio_q):
+                session.append(audio)
                 vad.accept_waveform(audio.tolist())
             vad.flush()
             self._decode_pending(recognizer, vad)
         finally:
             self._end_capture()
+            save_session_wav(session)
+            log_history(f"--- session end ({len(session) * CHUNK_SECS:.1f}s "
+                        f"audio captured) ---")
 
     def _run_streaming(self):
         audio_q = self._begin_capture()
+        session = deque(maxlen=int(600 / CHUNK_SECS))
+        log_history("--- session start ---")
         try:
             play_beep_start(self._config)
             GLib.idle_add(self._on_partial, "")
@@ -978,6 +1019,7 @@ class ASREngine:
                     audio = audio_q.get(timeout=0.1)
                 except queue.Empty:
                     continue
+                session.append(audio)
                 stream.accept_waveform(SAMPLE_RATE, audio.tolist())
 
                 while recognizer.is_ready(stream):
@@ -1001,6 +1043,9 @@ class ASREngine:
                     recognizer.reset(stream)
         finally:
             self._end_capture()
+            save_session_wav(session)
+            log_history(f"--- session end ({len(session) * CHUNK_SECS:.1f}s "
+                        f"audio captured) ---")
 
 
 # ---------------------------------------------------------------------------
@@ -1096,9 +1141,12 @@ class DictationController:
         return apply_word_replacements(text, self._config.word_replacements)
 
     def _on_final_text(self, text: str):
+        raw = text
         text = self._postprocess(text)
         if not text:
+            log_history(f"heard (filtered out): {raw}")
             return
+        log_history(f"typed: {text}")
         self._typer.type_text(text)
         if self._status_callback:
             self._status_callback("")
@@ -1111,7 +1159,9 @@ class DictationController:
 
     def _on_commit_partial(self, text: str):
         """Commit the streaming partial as final text."""
+        raw = text
         text = self._postprocess(text)
+        log_history(f"typed: {text}" if text else f"heard (filtered out): {raw}")
         self._typer.commit_partial(text)
         if self._status_callback:
             self._status_callback("")
@@ -1121,6 +1171,7 @@ class DictationController:
             self._status_callback(text)
 
     def _on_error(self, msg: str):
+        log_history(f"ERROR: {msg}")
         print(f"ERROR: {msg}", file=sys.stderr)
         if self._status_callback:
             self._status_callback(f"Error: {msg[:60]}")
@@ -2234,6 +2285,15 @@ class TrayIcon:
         settings_item = Gtk.MenuItem(label="Settings")
         settings_item.connect("activate", self._on_settings)
         menu.append(settings_item)
+
+        def open_history(_item):
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            HISTORY_FILE.touch()
+            subprocess.Popen(["xdg-open", str(HISTORY_FILE)])
+
+        history_item = Gtk.MenuItem(label="Dictation History")
+        history_item.connect("activate", open_history)
+        menu.append(history_item)
 
         menu.append(Gtk.SeparatorMenuItem())
 
