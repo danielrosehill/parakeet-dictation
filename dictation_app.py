@@ -48,7 +48,8 @@ CHUNK_SECS = 0.1  # mic callback granularity
 CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_SECS)
 PREROLL_SECS = 0.5  # pre-press audio spliced into a new session
 HISTORY_FILE = DATA_DIR / "history.log"
-LAST_SESSION_WAV = DATA_DIR / "last-session.wav"
+SESSIONS_DIR = DATA_DIR / "sessions"
+KEEP_SESSION_WAVS = 10
 
 
 def log_history(line: str) -> None:
@@ -61,22 +62,27 @@ def log_history(line: str) -> None:
         pass
 
 
-def save_session_wav(chunks) -> None:
-    """Write the session's mic audio to LAST_SESSION_WAV — ground truth
-    for 'did it hear me'.  Overwritten each session."""
+def save_session_wav(chunks):
+    """Write the session's mic audio to a timestamped wav — ground truth
+    for 'did it hear me'.  Keeps the last KEEP_SESSION_WAVS sessions."""
     if not chunks:
-        return
+        return None
     try:
         audio = np.concatenate(list(chunks))
         pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        with wave.open(str(LAST_SESSION_WAV), "wb") as w:
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        path = SESSIONS_DIR / f"session-{datetime.now():%Y%m%d-%H%M%S}.wav"
+        with wave.open(str(path), "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
             w.setframerate(SAMPLE_RATE)
             w.writeframes(pcm.tobytes())
+        for old in sorted(SESSIONS_DIR.glob("session-*.wav"))[:-KEEP_SESSION_WAVS]:
+            old.unlink()
+        return path
     except Exception as e:
         print(f"WARNING: could not save session audio: {e}", file=sys.stderr)
+        return None
 
 
 def _migrate_legacy_models():
@@ -605,6 +611,9 @@ class TenVadDetector:
         # and trailing silence, which must not qualify a blip as speech.
         if self._speech_samples >= self._min_speech_samples:
             self._segments.append(_SpeechSegment(list(self._buffer)))
+        elif self._speech_samples:
+            log_history(f"vad: discarded {self._speech_samples / self._sample_rate:.2f}s "
+                        f"blip (< min speech)")
         self._buffer.clear()
         self._in_speech = False
         self._speech_samples = 0
@@ -946,6 +955,8 @@ class ASREngine:
             s.accept_waveform(SAMPLE_RATE, vad.front.samples)
             recognizer.decode_stream(s)
             text = s.result.text.strip()
+            log_history(f"segment: {len(vad.front.samples) / SAMPLE_RATE:.1f}s "
+                        f"-> {text!r}")
             if text:
                 GLib.idle_add(self._on_text, text)
             vad.pop()
@@ -992,9 +1003,9 @@ class ASREngine:
             self._decode_pending(recognizer, vad)
         finally:
             self._end_capture()
-            save_session_wav(session)
+            wav = save_session_wav(session)
             log_history(f"--- session end ({len(session) * CHUNK_SECS:.1f}s "
-                        f"audio captured) ---")
+                        f"audio -> {wav.name if wav else 'none'}) ---")
 
     def _run_streaming(self):
         audio_q = self._begin_capture()
@@ -1043,9 +1054,9 @@ class ASREngine:
                     recognizer.reset(stream)
         finally:
             self._end_capture()
-            save_session_wav(session)
+            wav = save_session_wav(session)
             log_history(f"--- session end ({len(session) * CHUNK_SECS:.1f}s "
-                        f"audio captured) ---")
+                        f"audio -> {wav.name if wav else 'none'}) ---")
 
 
 # ---------------------------------------------------------------------------
