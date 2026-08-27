@@ -50,6 +50,12 @@ PREROLL_SECS = 0.5  # pre-press audio spliced into a new session
 HISTORY_FILE = DATA_DIR / "history.log"
 SESSIONS_DIR = DATA_DIR / "sessions"
 KEEP_SESSION_WAVS = 10
+# Parakeet TDT returns an *empty* transcript for long audio — not a bad
+# transcript, zero tokens.  Measured on real session wavs: fine to ~34s,
+# then blank at every length from ~36s up, in both the int8 and fp32
+# builds, so it is the model and not the quantization.  Below the cliff it
+# still blanks sporadically.  Nothing longer than this goes into one decode.
+MAX_DECODE_SECS = 10.0
 
 
 def log_history(line: str) -> None:
@@ -639,6 +645,28 @@ class TenVadDetector:
             self._emit_segment()
 
 
+def split_for_decode(samples: list, max_secs: float = MAX_DECODE_SECS) -> list:
+    """Cut a segment into <= ~1.2 * max_secs pieces, at the quietest point.
+
+    See MAX_DECODE_SECS.  The cut hunts the lowest-energy 100 ms in the
+    0.7-1.2 * max_secs window so it lands between words instead of mid-word;
+    no audio is dropped, the pieces concatenate back to the input.
+    """
+    lo = int(max_secs * 0.7 * SAMPLE_RATE)
+    hi = int(max_secs * 1.2 * SAMPLE_RATE)
+    hop = SAMPLE_RATE // 10
+    pieces = []
+    while len(samples) > hi:
+        win = np.asarray(samples[lo:hi], dtype=np.float32)
+        n = len(win) // hop
+        rms = (win[:n * hop].reshape(n, hop) ** 2).mean(axis=1)
+        cut = lo + int(rms.argmin()) * hop + hop // 2
+        pieces.append(samples[:cut])
+        samples = samples[cut:]
+    pieces.append(samples)
+    return pieces
+
+
 # ---------------------------------------------------------------------------
 # ASR Engine — supports offline (VAD-segmented) and streaming modes
 # ---------------------------------------------------------------------------
@@ -948,14 +976,41 @@ class ASREngine:
             except queue.Empty:
                 return chunks
 
+    @staticmethod
+    def _decode_once(recognizer, samples: list) -> str:
+        s = recognizer.create_stream()
+        s.accept_waveform(SAMPLE_RATE, samples)
+        recognizer.decode_stream(s)
+        return s.result.text.strip()
+
+    def _decode_piece(self, recognizer, samples: list) -> str:
+        """Decode one piece, nudging the audio if it comes back blank.
+
+        A blank is not always silence.  The same audio that decodes to
+        nothing decodes fine with 0.5 s of tail silence, or at 70 % gain —
+        the model is on a numerical knife edge, and per-utterance feature
+        normalisation couples the whole input, so either nudge moves it off.
+        """
+        text = self._decode_once(recognizer, samples)
+        if not text:
+            text = self._decode_once(recognizer, samples + [0.0] * (SAMPLE_RATE // 2))
+            if text:
+                log_history("decode: blank recovered on tail-silence retry")
+        if not text:
+            text = self._decode_once(recognizer, [v * 0.7 for v in samples])
+            if text:
+                log_history("decode: blank recovered on gain retry")
+        return text
+
     def _decode_pending(self, recognizer, vad):
         """Transcribe every completed VAD segment and emit its text."""
         while not vad.empty():
-            s = recognizer.create_stream()
-            s.accept_waveform(SAMPLE_RATE, vad.front.samples)
-            recognizer.decode_stream(s)
-            text = s.result.text.strip()
-            log_history(f"segment: {len(vad.front.samples) / SAMPLE_RATE:.1f}s "
+            samples = vad.front.samples
+            pieces = split_for_decode(samples)
+            text = " ".join(t for t in
+                            (self._decode_piece(recognizer, p) for p in pieces) if t)
+            log_history(f"segment: {len(samples) / SAMPLE_RATE:.1f}s"
+                        f"{f' in {len(pieces)} pieces' if len(pieces) > 1 else ''} "
                         f"-> {text!r}")
             if text:
                 GLib.idle_add(self._on_text, text)

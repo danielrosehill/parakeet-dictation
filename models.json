@@ -30,6 +30,40 @@
         }
       }
     },
+    "desktop-fp32": {
+      "name": "Parakeet TDT 0.6B v3 (fp32)",
+      "description": "Same model unquantized — cleanest wording. ~2432 MB download, ~2.6 GB RAM.",
+      "recommended_for": "Desktops with RAM to spare",
+      "hardware_label": "CPU",
+      "params": "600M",
+      "size_mb": 2432,
+      "streaming": false,
+      "feature_dim": 128,
+      "model_type": "nemo_transducer",
+      "decoder_type": "transducer",
+      "files": {
+        "encoder": {
+          "filename": "encoder.onnx",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3/resolve/main/encoder.onnx"
+        },
+        "encoder_weights": {
+          "filename": "encoder.weights",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3/resolve/main/encoder.weights"
+        },
+        "decoder": {
+          "filename": "decoder.onnx",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3/resolve/main/decoder.onnx"
+        },
+        "joiner": {
+          "filename": "joiner.onnx",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3/resolve/main/joiner.onnx"
+        },
+        "tokens": {
+          "filename": "tokens.txt",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3/resolve/main/tokens.txt"
+        }
+      }
+    },
     "laptop": {
       "name": "Canary 180M Flash (int8)",
       "description": "Lightweight, 4 languages (EN/ES/DE/FR). ~198 MB download, ~500 MB RAM.",

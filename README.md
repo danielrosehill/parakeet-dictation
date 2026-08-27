@@ -27,6 +27,7 @@ The NeMo family (Parakeet, Canary, Nemotron) was designed for production speech 
 | Profile | Model | Type | Params | Download | Best for |
 |---|---|---|---|---|---|
 | **desktop** | Parakeet TDT 0.6B v3 (int8) | Offline (VAD-segmented) | 600M | 639 MB | Desktop/workstation — best accuracy |
+| **desktop-fp32** | Parakeet TDT 0.6B v3 (fp32) | Offline (VAD-segmented) | 600M | 2432 MB | Same model unquantized — cleanest wording |
 | **laptop** | Canary 180M Flash (int8) | Offline (VAD-segmented) | 180M | 198 MB | Laptop, low RAM, travel |
 | **streaming** | Nemotron Streaming 0.6B (int8) | Online (frame-by-frame) | 600M | 631 MB | True real-time — lowest latency |
 
@@ -40,6 +41,7 @@ All models output punctuated, capitalized text natively.
 ### Choosing a model
 
 - **Desktop/workstation with plenty of RAM**: Use `desktop` (Parakeet TDT 0.6B). Best accuracy, handles accents and technical vocabulary well. ~2 GB RAM.
+- **RAM to spare**: Use `desktop-fp32` — the same model without int8 quantization, at the same decode speed (~190 ms per 10 s of audio). Slightly cleaner wording on technical terms. ~2.6 GB RAM.
 - **Laptop or low-RAM machine**: Use `laptop` (Canary 180M Flash). Only 198 MB download, ~500 MB RAM. Supports English, Spanish, German, and French.
 - **Lowest possible latency**: Use `streaming` (Nemotron Streaming 0.6B). Text appears as you speak rather than after pauses. English only.
 
@@ -72,6 +74,7 @@ uv pip install -r requirements.txt
 # Download models (or use the in-app model manager)
 uv pip install requests tqdm
 python download_models.py desktop    # 639 MB — best accuracy
+python download_models.py desktop-fp32  # 2432 MB — unquantized, needs ~2.6 GB RAM
 python download_models.py laptop     # 198 MB — lightweight
 python download_models.py streaming  # 631 MB — real-time
 python download_models.py all        # all profiles
