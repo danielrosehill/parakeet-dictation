@@ -4,6 +4,7 @@
 Usage:
     python download_models.py              # download default (desktop) profile
     python download_models.py desktop      # download desktop profile
+    python download_models.py desktop-fp32 # download unquantized desktop profile
     python download_models.py laptop       # download laptop profile
     python download_models.py streaming    # download streaming profile
     python download_models.py all          # download all profiles
