@@ -68,6 +68,21 @@ def main():
         t._send_backspaces(5)
         assert ["xdotool", "key", "--delay", "2", "--repeat", "5",
                 "BackSpace"] in calls, calls
+        # -- commit while a modifier is held: nothing typed, no duplicate --
+        t, calls = guarded_typer([False, False])
+        t._partial = "doing a weird"  # already on screen
+        t.commit_partial("Still doing a weird repeat.")
+        assert typed(calls) == "", calls
+        assert not any("BackSpace" in c for c in calls), calls
+        assert t._partial == ""
+
+        # -- commit once modifiers are up: partial fixed up in place -------
+        t, calls = guarded_typer([True])
+        t._partial = "doing a weird"
+        t.commit_partial("Still doing a weird repeat.")
+        assert ["xdotool", "key", "--delay", "2", "--repeat", "13",
+                "BackSpace"] in calls, calls
+        assert typed(calls) == "Still doing a weird repeat. ", calls
     finally:
         da.subprocess.run = real_run
 

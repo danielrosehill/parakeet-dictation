@@ -513,6 +513,12 @@ class TextTyper:
         """Commit (finalize) a partial: fix up the tail, add trailing space."""
         text = self._sanitize(text)
         backspaces, suffix = self._diff(self._partial, text)
+        if backspaces and not self._modifiers_clear():
+            # Still held (stop hotkey's Ctrl): the partial stays as typed.
+            # Dropping the backspaces but typing the final duplicated it.
+            self._drop(f"commit {text!r}")
+            self._partial = ""
+            return
         self._send_backspaces(backspaces)
         if text:
             self._type_raw(suffix + " ")
@@ -1172,6 +1178,15 @@ class ASREngine:
         """Pump mic chunks up and transcripts down until stop or the
         session deadline; the caller reconnects for the next stretch."""
         deadline = time.monotonic() + GEMINI_SESSION_SECS
+        partial_overwrite = self._config.partial_overwrite
+        # Hybrid VAD: the server waits ~1 s of silence before a final;
+        # an audio_stream_end on a locally detected pause gets it in ~0.3 s
+        # and the session stays open for the next utterance.
+        vad = TenVadDetector(
+            threshold=self._config.vad_threshold,
+            min_silence_duration=self._config.pause_secs or 10**9,
+            min_speech_duration=0.25, max_speech_duration=0,
+            sample_rate=SAMPLE_RATE)
 
         async def push(audio):
             session.append(audio)
@@ -1190,6 +1205,11 @@ class ASREngine:
                     await asyncio.sleep(0.02)
                     continue
                 await push(audio)
+                vad.accept_waveform(audio.tolist())
+                if not vad.empty():
+                    while not vad.empty():
+                        vad.pop()  # audio already sent; only the pause matters
+                    await live.send_realtime_input(audio_stream_end=True)
             if self._stop_event.is_set():
                 self._end_capture()
                 for audio in self._drain(audio_q):
@@ -1198,7 +1218,7 @@ class ASREngine:
 
         async def recv():
             async for msg in live.receive():
-                self._handle_gemini_event(msg.server_content)
+                self._handle_gemini_event(msg.server_content, partial_overwrite)
 
         recv_task = asyncio.ensure_future(recv())
         await send()
@@ -1208,13 +1228,11 @@ class ASREngine:
         except asyncio.TimeoutError:
             pass
 
-    def _handle_gemini_event(self, sc):
-        """Route one server_content: interims to the status bar, finals
-        typed whole.
-
-        ponytail: no partial typing here.  Finals arrive within a second
-        of the pause, and typing interims raced the stop hotkey (Ctrl still
-        held -> backspaces dropped -> final appended after the interim).
+    def _handle_gemini_event(self, sc, partial_overwrite: bool):
+        """Route one server_content into the same callbacks the local
+        streaming path uses.  Interims are the cumulative hypothesis for
+        the current utterance (~0.5 s cadence, ~1 s behind speech); the
+        final is that utterance in full.
         """
         if not sc:
             return
@@ -1222,11 +1240,17 @@ class ASREngine:
         text = ((interim.text if interim else "") or "").strip()
         if text:
             GLib.idle_add(self._on_partial, text)
+            if partial_overwrite:
+                self._partial_seq += 1
+                GLib.idle_add(self._emit_partial_type, self._partial_seq, text)
         final = getattr(sc, "input_transcription", None)
         text = ((final.text if final else "") or "").strip()
         if text:
             log_history(f"gemini final -> {text!r}")
-            GLib.idle_add(self._on_text, text)
+            if partial_overwrite:
+                GLib.idle_add(self._on_commit_partial, text)
+            else:
+                GLib.idle_add(self._on_text, text)
 
 
 # ---------------------------------------------------------------------------
