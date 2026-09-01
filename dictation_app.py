@@ -658,6 +658,13 @@ class TenVadDetector:
             self._emit_segment()
 
 
+def short_error(e: BaseException) -> str:
+    """One readable line for typing into the window.  Gemini API errors
+    stringify as '1007 None. <details>'; the details are the message."""
+    msg = getattr(e, "details", None) or getattr(e, "message", None) or str(e) or type(e).__name__
+    return str(msg).strip().splitlines()[0][:120]
+
+
 def pcm16(samples) -> bytes:
     """Float [-1, 1] samples -> 16-bit little-endian PCM (Live API input)."""
     return (np.clip(np.asarray(samples, dtype=np.float32), -1.0, 1.0)
@@ -925,7 +932,7 @@ class ASREngine:
             else:
                 self._run_offline()
         except Exception as e:
-            GLib.idle_add(self._on_error, str(e))
+            GLib.idle_add(self._on_error, short_error(e))
         finally:
             self._running = False
             play_beep_stop(self._config)
@@ -1372,6 +1379,9 @@ class DictationController:
     def _on_error(self, msg: str):
         log_history(f"ERROR: {msg}")
         print(f"ERROR: {msg}", file=sys.stderr)
+        # Into the window, replacing any half-typed partial: a rate limit
+        # or dead connection is otherwise invisible while dictating.
+        self._typer.commit_partial(f"[{msg}]")
         if self._status_callback:
             self._status_callback(f"Error: {msg[:60]}")
 

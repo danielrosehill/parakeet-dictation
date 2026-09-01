@@ -71,6 +71,14 @@ def main():
     assert seen == [("hello wor", "Hello world.")], seen
     assert c._typer._partial == "", "reset must still happen after the commit"
 
+    # Errors are typed over the on-screen partial, one short line
+    seen.clear()
+    c._typer._partial = "hello wor"
+    c._on_error(da.short_error(NS(details="Resource exhausted (rate limit)\nmore")))
+    assert seen == [("hello wor", "[Resource exhausted (rate limit)]")], seen
+    assert da.short_error(ValueError("boom")) == "boom"
+    assert da.short_error(RuntimeError()) == "RuntimeError"
+
     print("OK: gemini events route to partial/commit/final callbacks")
 
 
