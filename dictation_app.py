@@ -1179,14 +1179,10 @@ class ASREngine:
         session deadline; the caller reconnects for the next stretch."""
         deadline = time.monotonic() + GEMINI_SESSION_SECS
         partial_overwrite = self._config.partial_overwrite
-        # Hybrid VAD: the server waits ~1 s of silence before a final;
-        # an audio_stream_end on a locally detected pause gets it in ~0.3 s
-        # and the session stays open for the next utterance.
-        vad = TenVadDetector(
-            threshold=self._config.vad_threshold,
-            min_silence_duration=self._config.pause_secs or 10**9,
-            min_speech_duration=0.25, max_speech_duration=0,
-            sample_rate=SAMPLE_RATE)
+        # Turn detection is the server's: it groups sentences by real
+        # pauses and finalizes ~1 s after speech.  Ending turns on the
+        # local pause setting (0.25 s) chopped sentences at breaths, and
+        # the interims already have the words on screen by then.
 
         async def push(audio):
             session.append(audio)
@@ -1205,11 +1201,6 @@ class ASREngine:
                     await asyncio.sleep(0.02)
                     continue
                 await push(audio)
-                vad.accept_waveform(audio.tolist())
-                if not vad.empty():
-                    while not vad.empty():
-                        vad.pop()  # audio already sent; only the pause matters
-                    await live.send_realtime_input(audio_stream_end=True)
             if self._stop_event.is_set():
                 self._end_capture()
                 for audio in self._drain(audio_q):
