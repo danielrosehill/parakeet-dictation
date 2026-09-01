@@ -12,6 +12,7 @@ import re
 import shutil
 import signal
 import subprocess
+import asyncio
 import sys
 import threading
 import time
@@ -56,6 +57,9 @@ KEEP_SESSION_WAVS = 10
 # builds, so it is the model and not the quantization.  Below the cliff it
 # still blanks sporadically.  Nothing longer than this goes into one decode.
 MAX_DECODE_SECS = 10.0
+# The Gemini Live API caps a transcription session at 10 minutes; a fresh
+# socket is opened before that so a long dictation never dies mid-word.
+GEMINI_SESSION_SECS = 540
 
 
 def log_history(line: str) -> None:
@@ -158,6 +162,9 @@ class AppConfig:
     # Personal vocabulary: whole-word replacements applied to transcribed
     # text, case-insensitive, e.g. {"herder": "herdr"}
     word_replacements: dict = field(default_factory=dict)
+
+    # Gemini API key for the cloud transcribe profile (Settings > General)
+    gemini_api_key: str = ""
 
     # Language (for models that support it, e.g. Canary)
     language: str = "en"
@@ -645,6 +652,12 @@ class TenVadDetector:
             self._emit_segment()
 
 
+def pcm16(samples) -> bytes:
+    """Float [-1, 1] samples -> 16-bit little-endian PCM (Live API input)."""
+    return (np.clip(np.asarray(samples, dtype=np.float32), -1.0, 1.0)
+            * 32767).astype("<i2").tobytes()
+
+
 def split_for_decode(samples: list, max_secs: float = MAX_DECODE_SECS) -> list:
     """Cut a segment into <= ~1.2 * max_secs pieces, at the quietest point.
 
@@ -728,6 +741,8 @@ class ASREngine:
             self._ensure_mic()
         except Exception:
             pass  # no input device — reported when dictation starts
+        if self._profile.get("backend"):
+            return  # cloud profile: nothing to load
         try:
             self._ensure_models()
             recognizer = self._get_recognizer()
@@ -897,7 +912,9 @@ class ASREngine:
         is_streaming = self._profile.get("streaming", False)
 
         try:
-            if is_streaming:
+            if self._profile.get("backend") == "gemini":
+                self._run_gemini()
+            elif is_streaming:
                 self._run_streaming()
             else:
                 self._run_offline()
@@ -1112,6 +1129,114 @@ class ASREngine:
             wav = save_session_wav(session)
             log_history(f"--- session end ({len(session) * CHUNK_SECS:.1f}s "
                         f"audio -> {wav.name if wav else 'none'}) ---")
+
+    # -- Gemini Live (cloud) ------------------------------------------------
+
+    def _run_gemini(self):
+        audio_q = self._begin_capture()
+        session = deque(maxlen=int(600 / CHUNK_SECS))
+        log_history("--- session start (gemini) ---")
+        try:
+            play_beep_start(self._config)
+            GLib.idle_add(self._on_partial, "")
+            asyncio.run(self._gemini_loop(audio_q, session))
+        finally:
+            self._end_capture()
+            wav = save_session_wav(session)
+            log_history(f"--- session end ({len(session) * CHUNK_SECS:.1f}s "
+                        f"audio -> {wav.name if wav else 'none'}) ---")
+
+    async def _gemini_loop(self, audio_q, session):
+        from google import genai
+        from google.genai import types
+        key = self._config.gemini_api_key.strip()
+        if not key:
+            raise RuntimeError("Gemini API key not set (Settings > General)")
+        client = genai.Client(api_key=key)
+        # ponytail: the replacement targets double as vocabulary hints; a
+        # separate vocabulary list can come when someone asks for it.
+        vocab = list(self._config.word_replacements.values())[:1000]
+        cfg = types.LiveConnectConfig(
+            response_modalities=["TEXT"],
+            input_audio_transcription=types.AudioTranscriptionConfig(
+                mode=self._profile.get("transcription_mode", "SMART"),
+                custom_vocabulary=vocab or None,
+            ),
+        )
+        while not self._stop_event.is_set():
+            async with client.aio.live.connect(
+                    model=self._profile["model_id"], config=cfg) as live:
+                await self._gemini_session(live, types, audio_q, session)
+
+    async def _gemini_session(self, live, types, audio_q, session):
+        """Pump mic chunks up and transcripts down until stop or the
+        session deadline; the caller reconnects for the next stretch."""
+        deadline = time.monotonic() + GEMINI_SESSION_SECS
+        partial_overwrite = self._config.partial_overwrite
+
+        async def push(audio):
+            session.append(audio)
+            await live.send_realtime_input(audio=types.Blob(
+                data=pcm16(audio), mime_type=f"audio/pcm;rate={SAMPLE_RATE}"))
+
+        async def send():
+            while not self._stop_event.is_set() and time.monotonic() < deadline:
+                if self._paused:
+                    self._drain(audio_q)  # discard mic audio while paused
+                    await asyncio.sleep(0.1)
+                    continue
+                try:
+                    audio = audio_q.get_nowait()
+                except queue.Empty:
+                    await asyncio.sleep(0.02)
+                    continue
+                await push(audio)
+            if self._stop_event.is_set():
+                self._end_capture()
+                for audio in self._drain(audio_q):
+                    await push(audio)
+            await live.send_realtime_input(audio_stream_end=True)
+
+        async def recv():
+            async for msg in live.receive():
+                self._handle_gemini_event(msg.server_content, partial_overwrite)
+
+        recv_task = asyncio.ensure_future(recv())
+        await send()
+        # Let the server flush the last final after stream end.
+        try:
+            await asyncio.wait_for(recv_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+
+    def _handle_gemini_event(self, sc, partial_overwrite: bool):
+        """Route one server_content into the same callbacks the local
+        streaming path uses.
+
+        ponytail: interims are taken as the running hypothesis for the
+        current utterance and the final as that utterance in full (standard
+        ASR semantics).  Finals are logged so history.log shows if Gemini
+        actually sends deltas — then accumulate here.
+        """
+        if not sc:
+            return
+        interim = getattr(sc, "interim_input_transcription", None)
+        text = (interim.text if interim else "") or ""
+        text = text.strip()
+        if text:
+            GLib.idle_add(self._on_partial, text)
+            if partial_overwrite:
+                self._partial_seq += 1
+                GLib.idle_add(self._emit_partial_type, self._partial_seq, text)
+        final = getattr(sc, "input_transcription", None)
+        text = (final.text if final else "") or ""
+        text = text.strip()
+        if text:
+            log_history(f"gemini final -> {text!r}")
+            if partial_overwrite:
+                GLib.idle_add(self._on_commit_partial, text)
+            else:
+                GLib.idle_add(self._on_text, text)
 
 
 # ---------------------------------------------------------------------------
@@ -1391,8 +1516,8 @@ class HotkeyCaptureButton(Gtk.Button):
 
 def _any_model_downloaded(profiles: dict) -> bool:
     """Check if at least one model is downloaded."""
-    for mid in profiles:
-        if _is_model_downloaded(mid, profiles):
+    for mid, profile in profiles.items():
+        if profile.get("files") and _is_model_downloaded(mid, profiles):
             return True
     return False
 
@@ -1692,7 +1817,9 @@ class SettingsDialog(Gtk.Dialog):
             rec = mdata.get("recommended_for", "")
             hw = mdata.get("hardware_label", "CPU")
             langs = mdata.get("languages")
-            tag_parts = [f"{mdata['params']} params", f"{mdata['size_mb']} MB", hw]
+            tag_parts = [t for t in (
+                mdata.get("params") and f"{mdata['params']} params",
+                mdata.get("size_mb") and f"{mdata['size_mb']} MB", hw) if t]
             if rec:
                 tag_parts.append(rec)
             if langs:
@@ -1996,6 +2123,21 @@ class SettingsDialog(Gtk.Dialog):
         repl_scroll.add(self._repl_view)
         box.pack_start(repl_scroll, False, False, 4)
 
+        # Cloud
+        sep_cloud = Gtk.Separator()
+        sep_cloud.set_margin_top(4)
+        box.pack_start(sep_cloud, False, False, 0)
+        key_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        key_box.pack_start(Gtk.Label(label="Gemini API key:"), False, False, 0)
+        self._gemini_key_entry = Gtk.Entry()
+        self._gemini_key_entry.set_visibility(False)
+        self._gemini_key_entry.set_text(self._config.gemini_api_key)
+        self._gemini_key_entry.set_tooltip_text(
+            "Used by the Gemini 3.5 Transcribe (cloud) model.  "
+            "Create one at aistudio.google.com/apikey")
+        key_box.pack_start(self._gemini_key_entry, True, True, 0)
+        box.pack_start(key_box, False, False, 4)
+
         # Night mode
         sep = Gtk.Separator()
         sep.set_margin_top(8)
@@ -2041,6 +2183,7 @@ class SettingsDialog(Gtk.Dialog):
             for k, _, v in (line.partition("=") for line in raw.splitlines())
             if k.strip() and v.strip()
         }
+        self._config.gemini_api_key = self._gemini_key_entry.get_text().strip()
         self._config.night_mode = self._night_check.get_active()
         self._config.night_start = int(self._night_start_spin.get_value())
         self._config.night_end = int(self._night_end_spin.get_value())
