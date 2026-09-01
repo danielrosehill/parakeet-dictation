@@ -1,5 +1,5 @@
-"""Self-check: Gemini Live events route into the same partial/final
-callbacks the local streaming path uses.
+"""Self-check: Gemini Live interims reach the status bar only and
+finals are typed whole.
 
 Run with the app venv: .venv/bin/python3 test_gemini_backend.py
 Pure logic — no display, audio, network, or API key needed.
@@ -23,31 +23,21 @@ def main():
         on_commit_partial=lambda t: got.append(("commit", t)),
     )
 
-    eng._handle_gemini_event(None, True)
+    eng._handle_gemini_event(None)
     eng._handle_gemini_event(NS(interim_input_transcription=None,
-                                input_transcription=None), True)
+                                input_transcription=None))
     assert got == [], "empty events must be ignored"
 
+    # Interims only update the status bar — never typed
     eng._handle_gemini_event(NS(interim_input_transcription=NS(text="hello wor "),
-                                input_transcription=None), True)
-    assert got == [("status", "hello wor"), ("partial", "hello wor")], got
+                                input_transcription=None))
+    assert got == [("status", "hello wor")], got
 
-    got.clear()
-    eng._handle_gemini_event(NS(interim_input_transcription=None,
-                                input_transcription=NS(text="Hello world.")), True)
-    assert got == [("commit", "Hello world.")], got
-
-    # Without partial-overwrite, finals are typed whole and interims only show
+    # Finals are typed whole
     got.clear()
     eng._handle_gemini_event(NS(interim_input_transcription=NS(text="a"),
-                                input_transcription=NS(text="A.")), False)
-    assert got == [("status", "a"), ("text", "A.")], got
-
-    # A stop() bump invalidates queued partials
-    got.clear()
-    eng._partial_seq += 1
-    eng._emit_partial_type(eng._partial_seq - 1, "stale")
-    assert got == [], "stale partial must not be typed"
+                                input_transcription=NS(text="Hello world.")))
+    assert got == [("status", "a"), ("text", "Hello world.")], got
 
     # PCM conversion: full-scale float -> int16 little-endian, clipped
     pcm = da.pcm16([1.0, -1.0, 2.0, 0.0])
@@ -56,7 +46,7 @@ def main():
     # Cloud profiles never count as "downloaded" for the first-run dialog
     assert not da._any_model_downloaded({"gemini-live": {"backend": "gemini"}})
 
-    print("OK: gemini events route to partial/commit/final callbacks")
+    print("OK: gemini interims go to status, finals are typed whole")
 
 
 if __name__ == "__main__":

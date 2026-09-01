@@ -1172,7 +1172,6 @@ class ASREngine:
         """Pump mic chunks up and transcripts down until stop or the
         session deadline; the caller reconnects for the next stretch."""
         deadline = time.monotonic() + GEMINI_SESSION_SECS
-        partial_overwrite = self._config.partial_overwrite
 
         async def push(audio):
             session.append(audio)
@@ -1199,7 +1198,7 @@ class ASREngine:
 
         async def recv():
             async for msg in live.receive():
-                self._handle_gemini_event(msg.server_content, partial_overwrite)
+                self._handle_gemini_event(msg.server_content)
 
         recv_task = asyncio.ensure_future(recv())
         await send()
@@ -1209,34 +1208,25 @@ class ASREngine:
         except asyncio.TimeoutError:
             pass
 
-    def _handle_gemini_event(self, sc, partial_overwrite: bool):
-        """Route one server_content into the same callbacks the local
-        streaming path uses.
+    def _handle_gemini_event(self, sc):
+        """Route one server_content: interims to the status bar, finals
+        typed whole.
 
-        ponytail: interims are taken as the running hypothesis for the
-        current utterance and the final as that utterance in full (standard
-        ASR semantics).  Finals are logged so history.log shows if Gemini
-        actually sends deltas — then accumulate here.
+        ponytail: no partial typing here.  Finals arrive within a second
+        of the pause, and typing interims raced the stop hotkey (Ctrl still
+        held -> backspaces dropped -> final appended after the interim).
         """
         if not sc:
             return
         interim = getattr(sc, "interim_input_transcription", None)
-        text = (interim.text if interim else "") or ""
-        text = text.strip()
+        text = ((interim.text if interim else "") or "").strip()
         if text:
             GLib.idle_add(self._on_partial, text)
-            if partial_overwrite:
-                self._partial_seq += 1
-                GLib.idle_add(self._emit_partial_type, self._partial_seq, text)
         final = getattr(sc, "input_transcription", None)
-        text = (final.text if final else "") or ""
-        text = text.strip()
+        text = ((final.text if final else "") or "").strip()
         if text:
             log_history(f"gemini final -> {text!r}")
-            if partial_overwrite:
-                GLib.idle_add(self._on_commit_partial, text)
-            else:
-                GLib.idle_add(self._on_text, text)
+            GLib.idle_add(self._on_text, text)
 
 
 # ---------------------------------------------------------------------------
