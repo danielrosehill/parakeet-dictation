@@ -744,6 +744,9 @@ class ASREngine:
         self._audio_q: queue.Queue = queue.Queue()
         self._preroll_ring: deque = deque(
             maxlen=max(1, int(PREROLL_SECS / CHUNK_SECS)))
+        # Gemini: an interim without a final yet, and the event that final sets
+        self._gem_pending = False
+        self._gem_final = None
         threading.Thread(target=self._warm, daemon=True).start()
 
     def _get_recognizer(self):
@@ -1220,19 +1223,25 @@ class ASREngine:
                 self._end_capture()
                 for audio in self._drain(audio_q):
                     await push(audio)
+            self._gem_final.clear()
             await live.send_realtime_input(audio_stream_end=True)
 
         async def recv():
             async for msg in live.receive():
                 self._handle_gemini_event(msg.server_content, partial_overwrite)
 
+        self._gem_final = asyncio.Event()
         recv_task = asyncio.ensure_future(recv())
         await send()
-        # Let the server flush the last final after stream end.
-        try:
-            await asyncio.wait_for(recv_task, timeout=2.0)
-        except asyncio.TimeoutError:
-            pass
+        # The stream-end final takes ~0.3 s; receive() itself never ends
+        # (the server keeps the socket open), so wait for the final, and
+        # only if speech is still unfinalized.
+        if self._gem_pending:
+            try:
+                await asyncio.wait_for(self._gem_final.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+        recv_task.cancel()
 
     def _handle_gemini_event(self, sc, partial_overwrite: bool):
         """Route one server_content into the same callbacks the local
@@ -1245,6 +1254,7 @@ class ASREngine:
         interim = getattr(sc, "interim_input_transcription", None)
         text = ((interim.text if interim else "") or "").strip()
         if text:
+            self._gem_pending = True
             GLib.idle_add(self._on_partial, text)
             if partial_overwrite:
                 self._partial_seq += 1
@@ -1252,6 +1262,9 @@ class ASREngine:
         final = getattr(sc, "input_transcription", None)
         text = ((final.text if final else "") or "").strip()
         if text:
+            self._gem_pending = False
+            if self._gem_final is not None:
+                self._gem_final.set()
             log_history(f"gemini final -> {text!r}")
             if partial_overwrite:
                 GLib.idle_add(self._on_commit_partial, text)

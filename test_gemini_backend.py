@@ -43,6 +43,17 @@ def main():
                                 input_transcription=NS(text="A.")), False)
     assert got == [("status", "a"), ("text", "A.")], got
 
+    # Pending tracks "interim seen, no final yet" so stop waits only when needed
+    import asyncio
+    eng._gem_final = asyncio.Event()
+    eng._handle_gemini_event(NS(interim_input_transcription=NS(text="x"),
+                                input_transcription=None), True)
+    assert eng._gem_pending and not eng._gem_final.is_set()
+    eng._handle_gemini_event(NS(interim_input_transcription=None,
+                                input_transcription=NS(text="X.")), True)
+    assert not eng._gem_pending and eng._gem_final.is_set()
+    got.clear()
+
     # A stop() bump invalidates queued partials
     got.clear()
     eng._partial_seq += 1
