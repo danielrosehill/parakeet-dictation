@@ -56,6 +56,21 @@ def main():
     # Cloud profiles never count as "downloaded" for the first-run dialog
     assert not da._any_model_downloaded({"gemini-live": {"backend": "gemini"}})
 
+    # Stop must not forget the on-screen partial before the queued final commits
+    queued = []
+    da.GLib.idle_add = lambda fn, *a: queued.append((fn, a))
+    c = da.DictationController(da.AppConfig(beep_volume=0.0, model_profile="gemini-live"))
+    seen = []
+    c._typer._partial = "hello wor"
+    c._typer.commit_partial = lambda text: seen.append((c._typer._partial, text))
+    c._engine._handle_gemini_event(NS(interim_input_transcription=None,
+                                      input_transcription=NS(text="Hello world.")), True)
+    c.stop()
+    for fn, a in queued:
+        fn(*a)
+    assert seen == [("hello wor", "Hello world.")], seen
+    assert c._typer._partial == "", "reset must still happen after the commit"
+
     print("OK: gemini events route to partial/commit/final callbacks")
 
 

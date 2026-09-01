@@ -1313,7 +1313,10 @@ class DictationController:
 
     def stop(self):
         self._engine.stop()
-        self._typer.reset_partial()
+        # Queued, not direct: a cloud final can still be waiting in the idle
+        # queue after stop; resetting first made its commit retype the
+        # whole sentence after the on-screen partial.
+        GLib.idle_add(self._typer.reset_partial)
         if self._status_callback:
             self._status_callback("")
 
