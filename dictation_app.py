@@ -48,6 +48,12 @@ SAMPLE_RATE = 16000
 CHUNK_SECS = 0.1  # mic callback granularity
 CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_SECS)
 PREROLL_SECS = 0.5  # pre-press audio spliced into a new session
+# xdotool pacing.  Measured in a Tk entry and a gnome-terminal pty: a
+# 62-char rewrite took 0.33 s at 2 ms/key in 24-char pieces, 0.09 s with
+# these; every keystroke (incl. a remapped curly quote) still arrived.
+TYPE_DELAY_MS = 1
+TYPE_PIECE = 120  # chars per xdotool process; modifiers re-checked between
+BACKSPACE_DELAY_MS = 0
 HISTORY_FILE = DATA_DIR / "history.log"
 SESSIONS_DIR = DATA_DIR / "sessions"
 KEEP_SESSION_WAVS = 10
@@ -429,12 +435,13 @@ class TextTyper:
                 # Small pieces with a modifier re-check between them: a
                 # Ctrl pressed mid-injection chords at most one piece,
                 # then the rest is dropped instead of typed.
-                for i in range(0, len(text), 24):
+                for i in range(0, len(text), TYPE_PIECE):
                     if not self._modifiers_clear():
                         self._drop(text[i:])
                         return
-                    subprocess.run(["xdotool", "type", "--delay", "2", "--",
-                                    text[i:i + 24]],
+                    subprocess.run(["xdotool", "type", "--delay",
+                                    str(TYPE_DELAY_MS), "--",
+                                    text[i:i + TYPE_PIECE]],
                                    timeout=30, start_new_session=True)
             else:  # "clipboard" and unknown methods
                 subprocess.run(["wl-copy", "--", text], timeout=5)
@@ -468,7 +475,8 @@ class TextTyper:
                 if not self._modifiers_clear():
                     self._drop(f"<{count} backspaces>")
                     return
-                subprocess.run(["xdotool", "key", "--delay", "2",
+                subprocess.run(["xdotool", "key", "--delay",
+                                str(BACKSPACE_DELAY_MS),
                                 "--repeat", str(count), "BackSpace"],
                                timeout=10, start_new_session=True)
         except FileNotFoundError:
