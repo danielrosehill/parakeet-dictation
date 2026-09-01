@@ -4,3 +4,4 @@ pynput>=1.7
 numpy
 PyGObject
 ten-vad>=1.0.6
+google-genai>=2.0

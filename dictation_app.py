@@ -12,6 +12,7 @@ import re
 import shutil
 import signal
 import subprocess
+import asyncio
 import sys
 import threading
 import time
@@ -47,6 +48,12 @@ SAMPLE_RATE = 16000
 CHUNK_SECS = 0.1  # mic callback granularity
 CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_SECS)
 PREROLL_SECS = 0.5  # pre-press audio spliced into a new session
+# xdotool pacing.  Measured in a Tk entry and a gnome-terminal pty: a
+# 62-char rewrite took 0.33 s at 2 ms/key in 24-char pieces, 0.09 s with
+# these; every keystroke (incl. a remapped curly quote) still arrived.
+TYPE_DELAY_MS = 1
+TYPE_PIECE = 120  # chars per xdotool process; modifiers re-checked between
+BACKSPACE_DELAY_MS = 0
 HISTORY_FILE = DATA_DIR / "history.log"
 SESSIONS_DIR = DATA_DIR / "sessions"
 KEEP_SESSION_WAVS = 10
@@ -56,6 +63,9 @@ KEEP_SESSION_WAVS = 10
 # builds, so it is the model and not the quantization.  Below the cliff it
 # still blanks sporadically.  Nothing longer than this goes into one decode.
 MAX_DECODE_SECS = 10.0
+# The Gemini Live API caps a transcription session at 10 minutes; a fresh
+# socket is opened before that so a long dictation never dies mid-word.
+GEMINI_SESSION_SECS = 540
 
 
 def log_history(line: str) -> None:
@@ -158,6 +168,9 @@ class AppConfig:
     # Personal vocabulary: whole-word replacements applied to transcribed
     # text, case-insensitive, e.g. {"herder": "herdr"}
     word_replacements: dict = field(default_factory=dict)
+
+    # Gemini API key for the cloud transcribe profile (Settings > General)
+    gemini_api_key: str = ""
 
     # Language (for models that support it, e.g. Canary)
     language: str = "en"
@@ -422,12 +435,13 @@ class TextTyper:
                 # Small pieces with a modifier re-check between them: a
                 # Ctrl pressed mid-injection chords at most one piece,
                 # then the rest is dropped instead of typed.
-                for i in range(0, len(text), 24):
+                for i in range(0, len(text), TYPE_PIECE):
                     if not self._modifiers_clear():
                         self._drop(text[i:])
                         return
-                    subprocess.run(["xdotool", "type", "--delay", "2", "--",
-                                    text[i:i + 24]],
+                    subprocess.run(["xdotool", "type", "--delay",
+                                    str(TYPE_DELAY_MS), "--",
+                                    text[i:i + TYPE_PIECE]],
                                    timeout=30, start_new_session=True)
             else:  # "clipboard" and unknown methods
                 subprocess.run(["wl-copy", "--", text], timeout=5)
@@ -461,7 +475,8 @@ class TextTyper:
                 if not self._modifiers_clear():
                     self._drop(f"<{count} backspaces>")
                     return
-                subprocess.run(["xdotool", "key", "--delay", "2",
+                subprocess.run(["xdotool", "key", "--delay",
+                                str(BACKSPACE_DELAY_MS),
                                 "--repeat", str(count), "BackSpace"],
                                timeout=10, start_new_session=True)
         except FileNotFoundError:
@@ -506,6 +521,12 @@ class TextTyper:
         """Commit (finalize) a partial: fix up the tail, add trailing space."""
         text = self._sanitize(text)
         backspaces, suffix = self._diff(self._partial, text)
+        if backspaces and not self._modifiers_clear():
+            # Still held (stop hotkey's Ctrl): the partial stays as typed.
+            # Dropping the backspaces but typing the final duplicated it.
+            self._drop(f"commit {text!r}")
+            self._partial = ""
+            return
         self._send_backspaces(backspaces)
         if text:
             self._type_raw(suffix + " ")
@@ -645,6 +666,19 @@ class TenVadDetector:
             self._emit_segment()
 
 
+def short_error(e: BaseException) -> str:
+    """One readable line for typing into the window.  Gemini API errors
+    stringify as '1007 None. <details>'; the details are the message."""
+    msg = getattr(e, "details", None) or getattr(e, "message", None) or str(e) or type(e).__name__
+    return str(msg).strip().splitlines()[0][:120]
+
+
+def pcm16(samples) -> bytes:
+    """Float [-1, 1] samples -> 16-bit little-endian PCM (Live API input)."""
+    return (np.clip(np.asarray(samples, dtype=np.float32), -1.0, 1.0)
+            * 32767).astype("<i2").tobytes()
+
+
 def split_for_decode(samples: list, max_secs: float = MAX_DECODE_SECS) -> list:
     """Cut a segment into <= ~1.2 * max_secs pieces, at the quietest point.
 
@@ -710,6 +744,9 @@ class ASREngine:
         self._audio_q: queue.Queue = queue.Queue()
         self._preroll_ring: deque = deque(
             maxlen=max(1, int(PREROLL_SECS / CHUNK_SECS)))
+        # Gemini: an interim without a final yet, and the event that final sets
+        self._gem_pending = False
+        self._gem_final = None
         threading.Thread(target=self._warm, daemon=True).start()
 
     def _get_recognizer(self):
@@ -728,6 +765,8 @@ class ASREngine:
             self._ensure_mic()
         except Exception:
             pass  # no input device — reported when dictation starts
+        if self._profile.get("backend"):
+            return  # cloud profile: nothing to load
         try:
             self._ensure_models()
             recognizer = self._get_recognizer()
@@ -897,12 +936,14 @@ class ASREngine:
         is_streaming = self._profile.get("streaming", False)
 
         try:
-            if is_streaming:
+            if self._profile.get("backend") == "gemini":
+                self._run_gemini()
+            elif is_streaming:
                 self._run_streaming()
             else:
                 self._run_offline()
         except Exception as e:
-            GLib.idle_add(self._on_error, str(e))
+            GLib.idle_add(self._on_error, short_error(e))
         finally:
             self._running = False
             play_beep_stop(self._config)
@@ -1113,6 +1154,123 @@ class ASREngine:
             log_history(f"--- session end ({len(session) * CHUNK_SECS:.1f}s "
                         f"audio -> {wav.name if wav else 'none'}) ---")
 
+    # -- Gemini Live (cloud) ------------------------------------------------
+
+    def _run_gemini(self):
+        audio_q = self._begin_capture()
+        session = deque(maxlen=int(600 / CHUNK_SECS))
+        log_history("--- session start (gemini) ---")
+        try:
+            play_beep_start(self._config)
+            GLib.idle_add(self._on_partial, "")
+            asyncio.run(self._gemini_loop(audio_q, session))
+        finally:
+            self._end_capture()
+            wav = save_session_wav(session)
+            log_history(f"--- session end ({len(session) * CHUNK_SECS:.1f}s "
+                        f"audio -> {wav.name if wav else 'none'}) ---")
+
+    async def _gemini_loop(self, audio_q, session):
+        from google import genai
+        from google.genai import types
+        key = self._config.gemini_api_key.strip()
+        if not key:
+            raise RuntimeError("Gemini API key not set (Settings > General)")
+        client = genai.Client(api_key=key)
+        # ponytail: the replacement targets double as vocabulary hints; a
+        # separate vocabulary list can come when someone asks for it.
+        vocab = list(self._config.word_replacements.values())[:1000]
+        cfg = types.LiveConnectConfig(
+            response_modalities=["TEXT"],
+            input_audio_transcription=types.AudioTranscriptionConfig(
+                mode=self._profile.get("transcription_mode", "SMART"),
+                custom_vocabulary=vocab or None,
+            ),
+        )
+        while not self._stop_event.is_set():
+            async with client.aio.live.connect(
+                    model=self._profile["model_id"], config=cfg) as live:
+                await self._gemini_session(live, types, audio_q, session)
+
+    async def _gemini_session(self, live, types, audio_q, session):
+        """Pump mic chunks up and transcripts down until stop or the
+        session deadline; the caller reconnects for the next stretch."""
+        deadline = time.monotonic() + GEMINI_SESSION_SECS
+        partial_overwrite = self._config.partial_overwrite
+        # Turn detection is the server's: it groups sentences by real
+        # pauses and finalizes ~1 s after speech.  Ending turns on the
+        # local pause setting (0.25 s) chopped sentences at breaths, and
+        # the interims already have the words on screen by then.
+
+        async def push(audio):
+            session.append(audio)
+            await live.send_realtime_input(audio=types.Blob(
+                data=pcm16(audio), mime_type=f"audio/pcm;rate={SAMPLE_RATE}"))
+
+        async def send():
+            while not self._stop_event.is_set() and time.monotonic() < deadline:
+                if self._paused:
+                    self._drain(audio_q)  # discard mic audio while paused
+                    await asyncio.sleep(0.1)
+                    continue
+                try:
+                    audio = audio_q.get_nowait()
+                except queue.Empty:
+                    await asyncio.sleep(0.02)
+                    continue
+                await push(audio)
+            if self._stop_event.is_set():
+                self._end_capture()
+                for audio in self._drain(audio_q):
+                    await push(audio)
+            self._gem_final.clear()
+            await live.send_realtime_input(audio_stream_end=True)
+
+        async def recv():
+            async for msg in live.receive():
+                self._handle_gemini_event(msg.server_content, partial_overwrite)
+
+        self._gem_final = asyncio.Event()
+        recv_task = asyncio.ensure_future(recv())
+        await send()
+        # The stream-end final takes ~0.3 s; receive() itself never ends
+        # (the server keeps the socket open), so wait for the final, and
+        # only if speech is still unfinalized.
+        if self._gem_pending:
+            try:
+                await asyncio.wait_for(self._gem_final.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+        recv_task.cancel()
+
+    def _handle_gemini_event(self, sc, partial_overwrite: bool):
+        """Route one server_content into the same callbacks the local
+        streaming path uses.  Interims are the cumulative hypothesis for
+        the current utterance (~0.5 s cadence, ~1 s behind speech); the
+        final is that utterance in full.
+        """
+        if not sc:
+            return
+        interim = getattr(sc, "interim_input_transcription", None)
+        text = ((interim.text if interim else "") or "").strip()
+        if text:
+            self._gem_pending = True
+            GLib.idle_add(self._on_partial, text)
+            if partial_overwrite:
+                self._partial_seq += 1
+                GLib.idle_add(self._emit_partial_type, self._partial_seq, text)
+        final = getattr(sc, "input_transcription", None)
+        text = ((final.text if final else "") or "").strip()
+        if text:
+            self._gem_pending = False
+            if self._gem_final is not None:
+                self._gem_final.set()
+            log_history(f"gemini final -> {text!r}")
+            if partial_overwrite:
+                GLib.idle_add(self._on_commit_partial, text)
+            else:
+                GLib.idle_add(self._on_text, text)
+
 
 # ---------------------------------------------------------------------------
 # Dictation controller
@@ -1174,7 +1332,10 @@ class DictationController:
 
     def stop(self):
         self._engine.stop()
-        self._typer.reset_partial()
+        # Queued, not direct: a cloud final can still be waiting in the idle
+        # queue after stop; resetting first made its commit retype the
+        # whole sentence after the on-screen partial.
+        GLib.idle_add(self._typer.reset_partial)
         if self._status_callback:
             self._status_callback("")
 
@@ -1239,6 +1400,9 @@ class DictationController:
     def _on_error(self, msg: str):
         log_history(f"ERROR: {msg}")
         print(f"ERROR: {msg}", file=sys.stderr)
+        # Into the window, replacing any half-typed partial: a rate limit
+        # or dead connection is otherwise invisible while dictating.
+        self._typer.commit_partial(f"[{msg}]")
         if self._status_callback:
             self._status_callback(f"Error: {msg[:60]}")
 
@@ -1391,8 +1555,8 @@ class HotkeyCaptureButton(Gtk.Button):
 
 def _any_model_downloaded(profiles: dict) -> bool:
     """Check if at least one model is downloaded."""
-    for mid in profiles:
-        if _is_model_downloaded(mid, profiles):
+    for mid, profile in profiles.items():
+        if profile.get("files") and _is_model_downloaded(mid, profiles):
             return True
     return False
 
@@ -1499,7 +1663,7 @@ class WelcomeDialog(Gtk.Dialog):
         header.set_halign(Gtk.Align.START)
         box.pack_start(header, False, False, 0)
 
-        total_mb = sum(m["size_mb"] for m in self._profiles.values())
+        total_mb = sum(m.get("size_mb", 0) for m in self._profiles.values())
         subtitle = Gtk.Label()
         subtitle.set_markup(
             f"Three speech recognition models will be downloaded\n"
@@ -1515,7 +1679,7 @@ class WelcomeDialog(Gtk.Dialog):
             lbl = Gtk.Label()
             tag = "Streaming" if mdata.get("streaming") else "VAD-segmented"
             lbl.set_markup(
-                f"  \u2022 <b>{mdata['name']}</b>  ({mdata['size_mb']} MB, {tag})"
+                f"  \u2022 <b>{mdata['name']}</b>  ({mdata.get("size_mb", 0)} MB, {tag})"
             )
             lbl.set_halign(Gtk.Align.START)
             lbl.get_style_context().add_class("dim-label")
@@ -1632,7 +1796,7 @@ class SettingsDialog(Gtk.Dialog):
             Gtk.Image.new_from_icon_name("folder-download-symbolic", Gtk.IconSize.BUTTON),
             False, False, 0,
         )
-        total_mb = sum(m["size_mb"] for m in self._profiles.values())
+        total_mb = sum(m.get("size_mb", 0) for m in self._profiles.values())
         self._dl_all_label = Gtk.Label(label=f"Download All Models ({total_mb} MB)")
         dl_all_hbox.pack_start(self._dl_all_label, False, False, 0)
         self._dl_all_btn.add(dl_all_hbox)
@@ -1692,7 +1856,9 @@ class SettingsDialog(Gtk.Dialog):
             rec = mdata.get("recommended_for", "")
             hw = mdata.get("hardware_label", "CPU")
             langs = mdata.get("languages")
-            tag_parts = [f"{mdata['params']} params", f"{mdata['size_mb']} MB", hw]
+            tag_parts = [t for t in (
+                mdata.get("params") and f"{mdata['params']} params",
+                mdata.get("size_mb") and f"{mdata['size_mb']} MB", hw) if t]
             if rec:
                 tag_parts.append(rec)
             if langs:
@@ -1996,6 +2162,21 @@ class SettingsDialog(Gtk.Dialog):
         repl_scroll.add(self._repl_view)
         box.pack_start(repl_scroll, False, False, 4)
 
+        # Cloud
+        sep_cloud = Gtk.Separator()
+        sep_cloud.set_margin_top(4)
+        box.pack_start(sep_cloud, False, False, 0)
+        key_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        key_box.pack_start(Gtk.Label(label="Gemini API key:"), False, False, 0)
+        self._gemini_key_entry = Gtk.Entry()
+        self._gemini_key_entry.set_visibility(False)
+        self._gemini_key_entry.set_text(self._config.gemini_api_key)
+        self._gemini_key_entry.set_tooltip_text(
+            "Used by the Gemini 3.5 Transcribe (cloud) model.  "
+            "Create one at aistudio.google.com/apikey")
+        key_box.pack_start(self._gemini_key_entry, True, True, 0)
+        box.pack_start(key_box, False, False, 4)
+
         # Night mode
         sep = Gtk.Separator()
         sep.set_margin_top(8)
@@ -2041,6 +2222,7 @@ class SettingsDialog(Gtk.Dialog):
             for k, _, v in (line.partition("=") for line in raw.splitlines())
             if k.strip() and v.strip()
         }
+        self._config.gemini_api_key = self._gemini_key_entry.get_text().strip()
         self._config.night_mode = self._night_check.get_active()
         self._config.night_start = int(self._night_start_spin.get_value())
         self._config.night_end = int(self._night_end_spin.get_value())

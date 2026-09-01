@@ -34,11 +34,12 @@ def main():
     real_run = da.subprocess.run
     try:
         # -- clear modifiers: text goes out in <=24-char pieces, in order --
-        text = "abcdefghijklmnopqrstuvwxyz0123456789"
+        n = da.TYPE_PIECE
+        text = "abcdefghij" * (n // 10) + "tail"
         t, calls = guarded_typer([True, True])
         t._type_raw(text)
         pieces = [c[-1] for c in calls if c[:2] == ["xdotool", "type"]]
-        assert pieces == [text[:24], text[24:]], pieces
+        assert pieces == [text[:n], text[n:]], pieces
         assert typed(calls) == text
 
         # -- modifier held from the start: nothing typed, latch healed ----
@@ -49,8 +50,8 @@ def main():
 
         # -- modifier pressed mid-injection: rest of the text dropped -----
         t, calls = guarded_typer([True, False, False])
-        t._type_raw("x" * 30)
-        assert typed(calls) == "x" * 24, calls
+        t._type_raw("x" * (n + 6))
+        assert typed(calls) == "x" * n, calls
 
         # -- phantom latch: heal clears it, typing proceeds ---------------
         t, calls = guarded_typer([False, True])
@@ -66,8 +67,23 @@ def main():
         # -- backspace burst sent once modifiers are up -------------------
         t, calls = guarded_typer([True])
         t._send_backspaces(5)
-        assert ["xdotool", "key", "--delay", "2", "--repeat", "5",
+        assert ["xdotool", "key", "--delay", "0", "--repeat", "5",
                 "BackSpace"] in calls, calls
+        # -- commit while a modifier is held: nothing typed, no duplicate --
+        t, calls = guarded_typer([False, False])
+        t._partial = "doing a weird"  # already on screen
+        t.commit_partial("Still doing a weird repeat.")
+        assert typed(calls) == "", calls
+        assert not any("BackSpace" in c for c in calls), calls
+        assert t._partial == ""
+
+        # -- commit once modifiers are up: partial fixed up in place -------
+        t, calls = guarded_typer([True])
+        t._partial = "doing a weird"
+        t.commit_partial("Still doing a weird repeat.")
+        assert ["xdotool", "key", "--delay", "0", "--repeat", "13",
+                "BackSpace"] in calls, calls
+        assert typed(calls) == "Still doing a weird repeat. ", calls
     finally:
         da.subprocess.run = real_run
 

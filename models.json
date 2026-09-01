@@ -32,7 +32,7 @@
     },
     "desktop-fp32": {
       "name": "Parakeet TDT 0.6B v3 (fp32)",
-      "description": "Same model unquantized — cleanest wording. ~2432 MB download, ~2.6 GB RAM.",
+      "description": "Same model unquantized \u2014 cleanest wording. ~2432 MB download, ~2.6 GB RAM.",
       "recommended_for": "Desktops with RAM to spare",
       "hardware_label": "CPU",
       "params": "600M",
@@ -126,6 +126,17 @@
           "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemotron-speech-streaming-en-0.6b-int8-2026-01-14/resolve/main/tokens.txt"
         }
       }
+    },
+    "gemini-live": {
+      "name": "Gemini 3.5 Transcribe Live (cloud)",
+      "description": "Google's streaming speech-to-text over the network. Needs a Gemini API key (Settings > General) and internet; about $0.01/min. 85+ languages, auto-detected.",
+      "recommended_for": "Best accuracy when online",
+      "hardware_label": "Cloud",
+      "streaming": true,
+      "backend": "gemini",
+      "model_id": "gemini-3.5-transcribe-live",
+      "transcription_mode": "SMART",
+      "files": {}
     }
   }
 }

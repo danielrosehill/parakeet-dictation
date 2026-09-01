@@ -30,6 +30,7 @@ The NeMo family (Parakeet, Canary, Nemotron) was designed for production speech 
 | **desktop-fp32** | Parakeet TDT 0.6B v3 (fp32) | Offline (VAD-segmented) | 600M | 2432 MB | Same model unquantized — cleanest wording |
 | **laptop** | Canary 180M Flash (int8) | Offline (VAD-segmented) | 180M | 198 MB | Laptop, low RAM, travel |
 | **streaming** | Nemotron Streaming 0.6B (int8) | Online (frame-by-frame) | 600M | 631 MB | True real-time — lowest latency |
+| **gemini-live** | Gemini 3.5 Transcribe Live | Cloud streaming (Google Live API) | — | none | Best accuracy when online; needs an API key (Settings > General), ~$0.01/min |
 
 ### Model types explained
 
