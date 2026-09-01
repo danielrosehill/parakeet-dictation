@@ -1624,7 +1624,7 @@ class WelcomeDialog(Gtk.Dialog):
         header.set_halign(Gtk.Align.START)
         box.pack_start(header, False, False, 0)
 
-        total_mb = sum(m["size_mb"] for m in self._profiles.values())
+        total_mb = sum(m.get("size_mb", 0) for m in self._profiles.values())
         subtitle = Gtk.Label()
         subtitle.set_markup(
             f"Three speech recognition models will be downloaded\n"
@@ -1640,7 +1640,7 @@ class WelcomeDialog(Gtk.Dialog):
             lbl = Gtk.Label()
             tag = "Streaming" if mdata.get("streaming") else "VAD-segmented"
             lbl.set_markup(
-                f"  \u2022 <b>{mdata['name']}</b>  ({mdata['size_mb']} MB, {tag})"
+                f"  \u2022 <b>{mdata['name']}</b>  ({mdata.get("size_mb", 0)} MB, {tag})"
             )
             lbl.set_halign(Gtk.Align.START)
             lbl.get_style_context().add_class("dim-label")
@@ -1757,7 +1757,7 @@ class SettingsDialog(Gtk.Dialog):
             Gtk.Image.new_from_icon_name("folder-download-symbolic", Gtk.IconSize.BUTTON),
             False, False, 0,
         )
-        total_mb = sum(m["size_mb"] for m in self._profiles.values())
+        total_mb = sum(m.get("size_mb", 0) for m in self._profiles.values())
         self._dl_all_label = Gtk.Label(label=f"Download All Models ({total_mb} MB)")
         dl_all_hbox.pack_start(self._dl_all_label, False, False, 0)
         self._dl_all_btn.add(dl_all_hbox)
