@@ -27,8 +27,10 @@ The NeMo family (Parakeet, Canary, Nemotron) was designed for production speech 
 | Profile | Model | Type | Params | Download | Best for |
 |---|---|---|---|---|---|
 | **desktop** | Parakeet TDT 0.6B v3 (int8) | Offline (VAD-segmented) | 600M | 639 MB | Desktop/workstation — best accuracy |
+| **desktop-fp32** | Parakeet TDT 0.6B v3 (fp32) | Offline (VAD-segmented) | 600M | 2432 MB | Same model unquantized — cleanest wording |
 | **laptop** | Canary 180M Flash (int8) | Offline (VAD-segmented) | 180M | 198 MB | Laptop, low RAM, travel |
 | **streaming** | Nemotron Streaming 0.6B (int8) | Online (frame-by-frame) | 600M | 631 MB | True real-time — lowest latency |
+| **gemini-live** | Gemini 3.5 Transcribe Live | Cloud streaming (Google Live API) | — | none | Best accuracy when online; needs an API key (Settings > General), ~$0.01/min |
 
 ### Model types explained
 
@@ -40,6 +42,7 @@ All models output punctuated, capitalized text natively.
 ### Choosing a model
 
 - **Desktop/workstation with plenty of RAM**: Use `desktop` (Parakeet TDT 0.6B). Best accuracy, handles accents and technical vocabulary well. ~2 GB RAM.
+- **RAM to spare**: Use `desktop-fp32` — the same model without int8 quantization, at the same decode speed (~190 ms per 10 s of audio). Slightly cleaner wording on technical terms. ~2.6 GB RAM.
 - **Laptop or low-RAM machine**: Use `laptop` (Canary 180M Flash). Only 198 MB download, ~500 MB RAM. Supports English, Spanish, German, and French.
 - **Lowest possible latency**: Use `streaming` (Nemotron Streaming 0.6B). Text appears as you speak rather than after pauses. English only.
 
@@ -72,6 +75,7 @@ uv pip install -r requirements.txt
 # Download models (or use the in-app model manager)
 uv pip install requests tqdm
 python download_models.py desktop    # 639 MB — best accuracy
+python download_models.py desktop-fp32  # 2432 MB — unquantized, needs ~2.6 GB RAM
 python download_models.py laptop     # 198 MB — lightweight
 python download_models.py streaming  # 631 MB — real-time
 python download_models.py all        # all profiles
@@ -152,15 +156,24 @@ Choose your input device from:
 
 Leave set to "System Default" to use your desktop's default input device.
 
+The input stream stays open while the app runs (your desktop may show a
+mic-in-use indicator). While idle, only the last 0.5 seconds is kept in
+memory; nothing is transcribed or stored. That half-second is included
+when you press the hotkey, so your first words are never clipped.
+
 ### Model manager
 
 Open **Settings > Models** to browse available model profiles, download them in-app, and select which one to use.
 
 ### Audio feedback
 
-- **Rising tone** (880 Hz) — dictation started
-- **Falling tone** (440 Hz) — dictation stopped
-- **Double beep** (660 Hz) — paused/resumed
+Cues play from your desktop sound theme (via `canberra-gtk-play`), so they follow the theme and alert volume you set in **System Settings > Sound**:
+
+- **`device-added`** — dictation started
+- **`device-removed`** — dictation stopped
+- **`message`** — paused/resumed
+
+If `canberra-gtk-play` isn't installed (package `gnome-session-canberra` on Debian/Ubuntu), the app falls back to simple sine tones. The in-app beep-volume slider attenuates relative to the system alert volume.
 
 ### Night mode
 

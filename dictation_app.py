@@ -7,12 +7,19 @@ configurable hotkeys and VAD-segmented or true streaming transcription.
 
 import json
 import os
+import queue
 import re
+import shutil
 import signal
 import subprocess
+import asyncio
 import sys
 import threading
-from dataclasses import asdict, dataclass
+import time
+import wave
+from collections import deque
+from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from datetime import datetime
 from pathlib import Path
 
@@ -38,12 +45,64 @@ DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"
 MODELS_DIR = DATA_DIR / "models"
 MODELS_JSON = APP_DIR / "models.json"
 SAMPLE_RATE = 16000
+CHUNK_SECS = 0.1  # mic callback granularity
+CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_SECS)
+PREROLL_SECS = 0.5  # pre-press audio spliced into a new session
+# xdotool pacing.  Measured in a Tk entry and a gnome-terminal pty: a
+# 62-char rewrite took 0.33 s at 2 ms/key in 24-char pieces, 0.09 s with
+# these; every keystroke (incl. a remapped curly quote) still arrived.
+TYPE_DELAY_MS = 1
+TYPE_PIECE = 120  # chars per xdotool process; modifiers re-checked between
+BACKSPACE_DELAY_MS = 0
+HISTORY_FILE = DATA_DIR / "history.log"
+SESSIONS_DIR = DATA_DIR / "sessions"
+KEEP_SESSION_WAVS = 10
+# Parakeet TDT returns an *empty* transcript for long audio — not a bad
+# transcript, zero tokens.  Measured on real session wavs: fine to ~34s,
+# then blank at every length from ~36s up, in both the int8 and fp32
+# builds, so it is the model and not the quantization.  Below the cliff it
+# still blanks sporadically.  Nothing longer than this goes into one decode.
+MAX_DECODE_SECS = 10.0
+# The Gemini Live API caps a transcription session at 10 minutes; a fresh
+# socket is opened before that so a long dictation never dies mid-word.
+GEMINI_SESSION_SECS = 540
+
+
+def log_history(line: str) -> None:
+    """Append a timestamped line to the dictation history log."""
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(HISTORY_FILE, "a") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {line}\n")
+    except OSError:
+        pass
+
+
+def save_session_wav(chunks):
+    """Write the session's mic audio to a timestamped wav — ground truth
+    for 'did it hear me'.  Keeps the last KEEP_SESSION_WAVS sessions."""
+    if not chunks:
+        return None
+    try:
+        audio = np.concatenate(list(chunks))
+        pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        path = SESSIONS_DIR / f"session-{datetime.now():%Y%m%d-%H%M%S}.wav"
+        with wave.open(str(path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(SAMPLE_RATE)
+            w.writeframes(pcm.tobytes())
+        for old in sorted(SESSIONS_DIR.glob("session-*.wav"))[:-KEEP_SESSION_WAVS]:
+            old.unlink()
+        return path
+    except Exception as e:
+        print(f"WARNING: could not save session audio: {e}", file=sys.stderr)
+        return None
 
 
 def _migrate_legacy_models():
     """Move models from APP_DIR/models to the XDG data directory if needed."""
-    import shutil
-
     legacy = APP_DIR / "models"
     if not legacy.is_dir() or legacy == MODELS_DIR:
         return
@@ -62,8 +121,6 @@ def _migrate_legacy_models():
                 shutil.copy2(str(item), str(dest))
 
 
-_migrate_legacy_models()
-
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -75,6 +132,14 @@ class AppConfig:
     model_profile: str = "desktop"
     num_threads: int = min(os.cpu_count() or 4, 8)
     vad_threshold: float = 0.5
+
+    # Max seconds of continuous speech before a chunk is force-transcribed.
+    # 0 = no limit: transcribe only on a pause or when recording stops.
+    max_speech_secs: float = 30.0
+
+    # Seconds of silence that end a chunk and trigger transcription.
+    # 0 = never: everything is one chunk, transcribed when recording stops.
+    pause_secs: float = 0.25
 
     # Audio
     beep_volume: float = 0.5
@@ -100,6 +165,13 @@ class AppConfig:
     # Strip filler words ("um", "uh", "ehm" …) before injecting text
     filter_fillers: bool = True
 
+    # Personal vocabulary: whole-word replacements applied to transcribed
+    # text, case-insensitive, e.g. {"herder": "herdr"}
+    word_replacements: dict = field(default_factory=dict)
+
+    # Gemini API key for the cloud transcribe profile (Settings > General)
+    gemini_api_key: str = ""
+
     # Language (for models that support it, e.g. Canary)
     language: str = "en"
 
@@ -122,8 +194,9 @@ class AppConfig:
                     k: v for k, v in data.items()
                     if k in AppConfig.__dataclass_fields__
                 })
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"WARNING: ignoring bad config {CONFIG_FILE}: {e}",
+                      file=sys.stderr)
         return AppConfig()
 
 
@@ -158,32 +231,46 @@ def _is_night_mode(config: "AppConfig") -> bool:
         return config.night_start <= hour < config.night_end
 
 
-# Global config ref for beep functions (set in main)
-_active_config: "AppConfig | None" = None
+# canberra-gtk-play plays named events from the user's desktop sound theme,
+# honoring the theme choice and alert volume in system Settings -> Sound.
+_CANBERRA = shutil.which("canberra-gtk-play")
 
 
-def play_beep_start(volume: float = 0.5):
-    """Rising tone — dictation started."""
-    if _active_config and _is_night_mode(_active_config):
+def _play_event(event_id: str, config: AppConfig, fallback_tone) -> None:
+    """Play an XDG sound-theme event; sine-tone fallback without canberra."""
+    volume = config.beep_volume
+    if volume <= 0 or _is_night_mode(config):
         return
-    sd.play(_generate_tone(880, 0.15, volume), samplerate=SAMPLE_RATE)
+    if _CANBERRA:
+        # Beep-volume slider becomes attenuation relative to the alert volume
+        gain_db = 20 * np.log10(min(volume, 1.0))
+        # ponytail: one Popen per beep (~tens of ms latency); switch to
+        # ctypes libcanberra with a cached context if it feels laggy
+        subprocess.Popen(
+            [_CANBERRA, "-i", event_id, "-V", f"{gain_db:.1f}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    else:
+        sd.play(fallback_tone(volume), samplerate=SAMPLE_RATE)
 
 
-def play_beep_stop(volume: float = 0.5):
-    """Falling tone — dictation stopped."""
-    if _active_config and _is_night_mode(_active_config):
-        return
-    sd.play(_generate_tone(440, 0.15, volume), samplerate=SAMPLE_RATE)
+def play_beep_start(config: AppConfig):
+    """Dictation started — theme 'device-added' sound (rising tone fallback)."""
+    _play_event("device-added", config, lambda v: _generate_tone(880, 0.15, v))
 
 
-def play_beep_pause(volume: float = 0.5):
-    """Double short beep — paused/resumed."""
-    if _active_config and _is_night_mode(_active_config):
-        return
-    t1 = _generate_tone(660, 0.07, volume)
-    gap = np.zeros(int(SAMPLE_RATE * 0.05), dtype=np.float32)
-    t2 = _generate_tone(660, 0.07, volume)
-    sd.play(np.concatenate([t1, gap, t2]), samplerate=SAMPLE_RATE)
+def play_beep_stop(config: AppConfig):
+    """Dictation stopped — theme 'device-removed' sound (falling tone fallback)."""
+    _play_event("device-removed", config, lambda v: _generate_tone(440, 0.15, v))
+
+
+def play_beep_pause(config: AppConfig):
+    """Paused/resumed — theme 'message' sound (double beep fallback)."""
+    def double_beep(volume):
+        t = _generate_tone(660, 0.07, volume)
+        gap = np.zeros(int(SAMPLE_RATE * 0.05), dtype=np.float32)
+        return np.concatenate([t, gap, t])
+    _play_event("message", config, double_beep)
 
 
 # ---------------------------------------------------------------------------
@@ -223,11 +310,38 @@ _FILLER_RE = re.compile(
 _MULTI_SPACE_RE = re.compile(r"  +")
 
 
-def filter_fillers(text: str) -> str:
+def strip_fillers(text: str) -> str:
     """Remove common filler words, collapse resulting double-spaces."""
     text = _FILLER_RE.sub("", text)
     text = _MULTI_SPACE_RE.sub(" ", text).strip()
     return text
+
+
+# ---------------------------------------------------------------------------
+# Word replacements (personal vocabulary)
+# ---------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=4)
+def _word_re(words: tuple[str, ...]) -> re.Pattern:
+    # Longest-first so "note book" wins over "note" when both are keys.
+    alts = "|".join(re.escape(w) for w in sorted(words, key=len, reverse=True))
+    return re.compile(rf"\b(?:{alts})\b", re.IGNORECASE)
+
+
+def apply_word_replacements(text: str, mapping: dict) -> str:
+    """Replace whole words case-insensitively, keeping a leading capital."""
+    if not mapping or not text:
+        return text
+    lower = {k.lower(): v for k, v in mapping.items()}
+
+    def _sub(m: re.Match) -> str:
+        rep = lower[m.group(0).lower()]
+        if rep and m.group(0)[0].isupper():
+            return rep[0].upper() + rep[1:]
+        return rep
+
+    return _word_re(tuple(sorted(lower))).sub(_sub, text)
 
 
 # ---------------------------------------------------------------------------
@@ -237,27 +351,106 @@ def filter_fillers(text: str) -> str:
 class TextTyper:
     def __init__(self, method: str = "clipboard"):
         self._method = method
-        # Tracks how many characters of the current partial are on-screen
-        # so we can backspace them before typing a revision.
-        self._partial_len = 0
+        # The current partial as typed on-screen, so a revision only needs
+        # to erase/retype the differing tail instead of the whole string.
+        self._partial = ""
+        self._xdisplay = None
+        self._mod_keycodes = ()
+        if method in ("xdotool", "clipboard"):
+            self._heal_modifiers()
+
+    @staticmethod
+    def _heal_modifiers():
+        """Release any phantom modifier a crashed/killed injector left
+        latched.  keyup-only: releases an XTEST-held modifier, no-op for
+        one the user is physically holding (core state is the union of
+        all device states)."""
+        try:
+            subprocess.run(["xdotool", "keyup", "ctrl", "shift", "alt",
+                            "super"], timeout=5, start_new_session=True)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+    def _wait_modifiers_up(self, timeout: float = 2.0) -> bool:
+        """Wait until no modifier key is held; True if they were released.
+
+        Typing while the user still holds the hotkey's Ctrl garbles the
+        target app.  xdotool's --clearmodifiers "solves" that by releasing
+        and then RE-PRESSING the modifier — and on Xorg that synthetic
+        re-press outlives the process, latching a phantom Ctrl once the
+        user's physical release has already happened.  So: never touch
+        modifiers, just wait for the user's hand to lift.
+        """
+        try:
+            from Xlib.display import Display
+        except ImportError:
+            return True
+        if self._xdisplay is None:
+            self._xdisplay = Display()
+            self._mod_keycodes = {
+                kc for row in self._xdisplay.get_modifier_mapping()
+                for kc in row if kc}
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            keys = self._xdisplay.query_keymap()
+            if not any(keys[kc >> 3] & (1 << (kc & 7))
+                       for kc in self._mod_keycodes):
+                return True
+            time.sleep(0.02)
+        return False
+
+    def _modifiers_clear(self) -> bool:
+        """True once no modifier is held; never inject on False.
+
+        A modifier down while XTEST types turns every character into a
+        hotkey chord (a held Ctrl made each 't' a Ctrl+T = new terminal
+        in the focused app).  On timeout, heal a possible phantom latch
+        and re-wait; a modifier still down then is physically held, so
+        the caller must drop its keystrokes, not send them.
+        """
+        if self._wait_modifiers_up():
+            return True
+        self._heal_modifiers()
+        return self._wait_modifiers_up()
+
+    def _drop(self, text: str):
+        print(f"WARNING: modifier key held; dropped instead of typing: "
+              f"{text!r}", file=sys.stderr)
 
     # -- low-level helpers --------------------------------------------------
 
     def _type_raw(self, text: str):
         """Type a string into the active window (no newline safety)."""
+        # ponytail: if/elif on self._method here, in _send_backspaces and in
+        # __init__ — switch to per-method strategy objects if a 5th typer lands
         try:
-            if self._method == "clipboard":
-                subprocess.run(["wl-copy", "--", text], timeout=5)
-                import time; time.sleep(0.05)
-                subprocess.run(["xdotool", "key", "ctrl+v"], timeout=5)
-            elif self._method == "wtype":
+            if self._method == "wtype":
                 subprocess.run(["wtype", "--", text], timeout=5)
             elif self._method == "ydotool":
                 subprocess.run(["ydotool", "type", "--", text], timeout=5)
-            else:
+            elif self._method == "xdotool":
+                # X11: type directly, no clipboard involved.  No
+                # --clearmodifiers (see _wait_modifiers_up); new session so
+                # a terminal Ctrl+C on the app can't kill it mid-keystroke.
+                # Small pieces with a modifier re-check between them: a
+                # Ctrl pressed mid-injection chords at most one piece,
+                # then the rest is dropped instead of typed.
+                for i in range(0, len(text), TYPE_PIECE):
+                    if not self._modifiers_clear():
+                        self._drop(text[i:])
+                        return
+                    subprocess.run(["xdotool", "type", "--delay",
+                                    str(TYPE_DELAY_MS), "--",
+                                    text[i:i + TYPE_PIECE]],
+                                   timeout=30, start_new_session=True)
+            else:  # "clipboard" and unknown methods
                 subprocess.run(["wl-copy", "--", text], timeout=5)
-                import time; time.sleep(0.05)
-                subprocess.run(["xdotool", "key", "ctrl+v"], timeout=5)
+                time.sleep(0.05)
+                if not self._modifiers_clear():
+                    self._drop(text)
+                    return
+                subprocess.run(["xdotool", "key", "ctrl+v"], timeout=5,
+                               start_new_session=True)
         except FileNotFoundError:
             print(f"ERROR: {self._method} not found.", file=sys.stderr)
         except subprocess.TimeoutExpired:
@@ -276,9 +469,16 @@ class TextTyper:
                 for _ in range(count):
                     subprocess.run(["wtype", "-k", "BackSpace"], timeout=5)
             else:
-                # clipboard method — fall back to xdotool for backspace
-                for _ in range(count):
-                    subprocess.run(["xdotool", "key", "BackSpace"], timeout=5)
+                # X11 (xdotool/clipboard): one process for the whole burst.
+                # A held Ctrl would make every one a Ctrl+BackSpace
+                # (delete-word) in the focused app — drop, never send.
+                if not self._modifiers_clear():
+                    self._drop(f"<{count} backspaces>")
+                    return
+                subprocess.run(["xdotool", "key", "--delay",
+                                str(BACKSPACE_DELAY_MS),
+                                "--repeat", str(count), "BackSpace"],
+                               timeout=10, start_new_session=True)
         except FileNotFoundError:
             print(f"ERROR: backspace helper not found for {self._method}.", file=sys.stderr)
         except subprocess.TimeoutExpired:
@@ -288,6 +488,12 @@ class TextTyper:
     def _sanitize(text: str) -> str:
         """Strip newlines/carriage-returns — never inject Enter."""
         return text.replace("\n", " ").replace("\r", " ").strip()
+
+    @staticmethod
+    def _diff(old: str, new: str) -> tuple[int, str]:
+        """Return (backspaces, suffix) that edits *old* into *new*."""
+        i = len(os.path.commonprefix((old, new)))
+        return len(old) - i, new[i:]
 
     # -- public API ---------------------------------------------------------
 
@@ -299,26 +505,36 @@ class TextTyper:
         self._type_raw(text + " ")
 
     def type_partial(self, text: str):
-        """Type a streaming partial, erasing the previous partial first."""
+        """Type a streaming partial, erasing only what the revision changed."""
         text = self._sanitize(text)
-        if not text:
+        if not text or text == self._partial:
             return
-        # Erase whatever we typed last time
-        self._send_backspaces(self._partial_len)
-        self._type_raw(text)
-        self._partial_len = len(text)
+        if not self._wait_modifiers_up():
+            return  # user is holding a modifier; drop — a fresher partial follows
+        backspaces, suffix = self._diff(self._partial, text)
+        self._send_backspaces(backspaces)
+        if suffix:
+            self._type_raw(suffix)
+        self._partial = text
 
     def commit_partial(self, text: str):
-        """Commit (finalize) a partial: erase old partial, type final + space."""
+        """Commit (finalize) a partial: fix up the tail, add trailing space."""
         text = self._sanitize(text)
-        self._send_backspaces(self._partial_len)
-        self._partial_len = 0
+        backspaces, suffix = self._diff(self._partial, text)
+        if backspaces and not self._modifiers_clear():
+            # Still held (stop hotkey's Ctrl): the partial stays as typed.
+            # Dropping the backspaces but typing the final duplicated it.
+            self._drop(f"commit {text!r}")
+            self._partial = ""
+            return
+        self._send_backspaces(backspaces)
         if text:
-            self._type_raw(text + " ")
+            self._type_raw(suffix + " ")
+        self._partial = ""
 
     def reset_partial(self):
         """Discard partial tracking without erasing anything on screen."""
-        self._partial_len = 0
+        self._partial = ""
 
 
 # ---------------------------------------------------------------------------
@@ -345,28 +561,37 @@ class TenVadDetector:
         self._sample_rate = sample_rate
         self._min_silence_samples = int(min_silence_duration * sample_rate)
         self._min_speech_samples = int(min_speech_duration * sample_rate)
-        self._max_speech_samples = int(max_speech_duration * sample_rate)
+        # <= 0 means unlimited: segment only on silence or explicit flush()
+        self._max_speech_samples = (
+            int(max_speech_duration * sample_rate) if max_speech_duration > 0 else 0
+        )
 
         self._vad = TenVad(hop_size=self._hop_size, threshold=threshold)
 
         # Internal state
         self._buffer: list[float] = []  # float32 samples for ASR
-        self._int16_remainder = np.array([], dtype=np.int16)  # leftover for VAD
+        # Sub-hop leftover, kept as float samples so the audio buffered for
+        # ASR and the audio the VAD classifies are sliced from the same
+        # array — a separate int16 remainder desynced them and dropped ~64
+        # samples of real audio per call at chunk boundaries.
+        self._remainder: list[float] = []
         self._in_speech = False
         self._speech_samples = 0
         self._silence_samples = 0
         self._segments: list[_SpeechSegment] = []
         self._is_speech = False
+        # Pre-roll: keep ~0.3s of the most recent non-speech audio and
+        # prepend it when speech starts, so the soft onset of the first
+        # word (before the detector crosses threshold) isn't clipped.
+        self._preroll: deque[list[float]] = deque(
+            maxlen=max(1, int(0.3 * sample_rate) // self._hop_size))
 
     def accept_waveform(self, samples: list[float]):
         """Feed float32 audio samples (matching sounddevice output)."""
-        # Convert to int16 for TEN VAD
-        arr = np.array(samples, dtype=np.float32)
-        int16_data = (arr * 32767).astype(np.int16)
-
         # Prepend any leftover from previous call
-        if len(self._int16_remainder) > 0:
-            int16_data = np.concatenate([self._int16_remainder, int16_data])
+        data = self._remainder + list(samples)
+        # Convert to int16 for TEN VAD
+        int16_data = (np.asarray(data, dtype=np.float32) * 32767).astype(np.int16)
 
         # Process in hop_size chunks
         i = 0
@@ -375,7 +600,7 @@ class TenVadDetector:
             prob, _flag = self._vad.process(chunk)
             is_speech = prob >= self._threshold
 
-            float_chunk = samples[i:i + self._hop_size] if i + self._hop_size <= len(samples) else arr[i:i + self._hop_size].tolist()
+            float_chunk = data[i:i + self._hop_size]
 
             if is_speech:
                 self._is_speech = True
@@ -383,11 +608,14 @@ class TenVadDetector:
                 if not self._in_speech:
                     self._in_speech = True
                     self._speech_samples = 0
+                    for pre in self._preroll:
+                        self._buffer.extend(pre)
+                    self._preroll.clear()
                 self._buffer.extend(float_chunk)
                 self._speech_samples += self._hop_size
 
-                # Force segment if max duration reached
-                if self._speech_samples >= self._max_speech_samples:
+                # Force segment if max duration reached (0 = unlimited)
+                if self._max_speech_samples and self._speech_samples >= self._max_speech_samples:
                     self._emit_segment()
             else:
                 if self._in_speech:
@@ -397,16 +625,22 @@ class TenVadDetector:
                         self._emit_segment()
                 else:
                     self._is_speech = False
+                    self._preroll.append(float_chunk)
 
             i += self._hop_size
 
         # Save leftover
-        self._int16_remainder = int16_data[i:]
+        self._remainder = data[i:]
 
     def _emit_segment(self):
         """Finalize current speech buffer into a segment."""
-        if len(self._buffer) >= self._min_speech_samples:
+        # Gate on actual speech samples — the buffer also holds pre-roll
+        # and trailing silence, which must not qualify a blip as speech.
+        if self._speech_samples >= self._min_speech_samples:
             self._segments.append(_SpeechSegment(list(self._buffer)))
+        elif self._speech_samples:
+            log_history(f"vad: discarded {self._speech_samples / self._sample_rate:.2f}s "
+                        f"blip (< min speech)")
         self._buffer.clear()
         self._in_speech = False
         self._speech_samples = 0
@@ -432,6 +666,41 @@ class TenVadDetector:
             self._emit_segment()
 
 
+def short_error(e: BaseException) -> str:
+    """One readable line for typing into the window.  Gemini API errors
+    stringify as '1007 None. <details>'; the details are the message."""
+    msg = getattr(e, "details", None) or getattr(e, "message", None) or str(e) or type(e).__name__
+    return str(msg).strip().splitlines()[0][:120]
+
+
+def pcm16(samples) -> bytes:
+    """Float [-1, 1] samples -> 16-bit little-endian PCM (Live API input)."""
+    return (np.clip(np.asarray(samples, dtype=np.float32), -1.0, 1.0)
+            * 32767).astype("<i2").tobytes()
+
+
+def split_for_decode(samples: list, max_secs: float = MAX_DECODE_SECS) -> list:
+    """Cut a segment into <= ~1.2 * max_secs pieces, at the quietest point.
+
+    See MAX_DECODE_SECS.  The cut hunts the lowest-energy 100 ms in the
+    0.7-1.2 * max_secs window so it lands between words instead of mid-word;
+    no audio is dropped, the pieces concatenate back to the input.
+    """
+    lo = int(max_secs * 0.7 * SAMPLE_RATE)
+    hi = int(max_secs * 1.2 * SAMPLE_RATE)
+    hop = SAMPLE_RATE // 10
+    pieces = []
+    while len(samples) > hi:
+        win = np.asarray(samples[lo:hi], dtype=np.float32)
+        n = len(win) // hop
+        rms = (win[:n * hop].reshape(n, hop) ** 2).mean(axis=1)
+        cut = lo + int(rms.argmin()) * hop + hop // 2
+        pieces.append(samples[:cut])
+        samples = samples[cut:]
+    pieces.append(samples)
+    return pieces
+
+
 # ---------------------------------------------------------------------------
 # ASR Engine — supports offline (VAD-segmented) and streaming modes
 # ---------------------------------------------------------------------------
@@ -452,6 +721,66 @@ class ASREngine:
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()  # set = NOT paused
         self._pause_event.set()
+        # Monotonic stamp for streaming partials.  The GTK idle queue can
+        # lag behind the 100 ms partial cadence; stale queued partials must
+        # be dropped, not typed, or the app keeps typing after stop.
+        self._partial_seq = 0
+        # The model is cached across starts and loaded in the background at
+        # engine build — a cold load takes seconds and used to run between
+        # the hotkey press and the mic opening, eating the first sentence.
+        self._recognizer = None
+        self._recognizer_lock = threading.Lock()
+        # Persistent mic: opened once (in _warm) and never closed between
+        # sessions — opening the stream per press cost 100-300 ms of lost
+        # speech.  While idle the callback keeps the newest PREROLL_SECS
+        # in a ring; _begin_capture splices that in front of the live
+        # queue, so words spoken at (or just before) the hotkey press
+        # are transcribed too.
+        self._mic_stream = None
+        self._mic_dev = None
+        self._mic_lock = threading.Lock()
+        self._route_lock = threading.Lock()
+        self._capturing = False
+        self._audio_q: queue.Queue = queue.Queue()
+        self._preroll_ring: deque = deque(
+            maxlen=max(1, int(PREROLL_SECS / CHUNK_SECS)))
+        # Gemini: an interim without a final yet, and the event that final sets
+        self._gem_pending = False
+        self._gem_final = None
+        threading.Thread(target=self._warm, daemon=True).start()
+
+    def _get_recognizer(self):
+        with self._recognizer_lock:
+            if self._recognizer is None:
+                if self._profile.get("streaming", False):
+                    self._recognizer = self._build_online_recognizer()
+                else:
+                    self._recognizer = self._build_offline_recognizer()
+            return self._recognizer
+
+    def _warm(self):
+        try:
+            # Mic first: the stream must be live before any model work so
+            # the ring holds audio from the moment the app starts.
+            self._ensure_mic()
+        except Exception:
+            pass  # no input device — reported when dictation starts
+        if self._profile.get("backend"):
+            return  # cloud profile: nothing to load
+        try:
+            self._ensure_models()
+            recognizer = self._get_recognizer()
+            # First inference allocates lazily; push 0.5s of silence through
+            # so the first real segment decodes at full speed.
+            s = recognizer.create_stream()
+            s.accept_waveform(SAMPLE_RATE, [0.0] * (SAMPLE_RATE // 2))
+            if self._profile.get("streaming", False):
+                while recognizer.is_ready(s):
+                    recognizer.decode_stream(s)
+            else:
+                recognizer.decode_stream(s)
+        except Exception:
+            pass  # missing models etc. are reported when dictation starts
 
     def _get_model_dir(self) -> Path:
         return MODELS_DIR / self._config.model_profile
@@ -533,11 +862,15 @@ class ASREngine:
         )
 
     def _build_vad(self):
+        # ponytail: pause_secs 0 maps to an unreachably-large silence threshold
+        # = never emit on pause — the whole recording buffers in RAM and
+        # flush() on stop sends one chunk.  ~27 MB/min of audio; fine for
+        # dictation.
         return TenVadDetector(
             threshold=self._config.vad_threshold,
-            min_silence_duration=0.25,
+            min_silence_duration=self._config.pause_secs or 10**9,
             min_speech_duration=0.25,
-            max_speech_duration=30.0,
+            max_speech_duration=self._config.max_speech_secs,
             sample_rate=SAMPLE_RATE,
         )
 
@@ -555,12 +888,17 @@ class ASREngine:
         self._stop_event.clear()
         self._pause_event.set()
         self._paused = False
+        # Set before the thread runs: toggle() must see "running" the
+        # moment start() returns, or a second hotkey fire during init
+        # starts a second capture thread instead of stopping this one.
+        self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def stop(self):
         if not self._running:
             return
+        self._partial_seq += 1  # invalidate any queued partial typing
         self._stop_event.set()
         self._pause_event.set()
         if self._thread:
@@ -568,120 +906,228 @@ class ASREngine:
         self._running = False
         self._paused = False
 
-    def pause(self):
+    def _emit_partial_type(self, seq: int, text: str):
+        """Type a partial only if it is still the newest one produced."""
+        if seq == self._partial_seq:
+            self._on_partial_type(text)
+
+    def toggle_pause(self):
         if not self._running:
             return
         if self._paused:
             self._paused = False
             self._pause_event.set()
-            play_beep_pause(self._config.beep_volume)
+            play_beep_pause(self._config)
             GLib.idle_add(self._on_partial, "Resumed")
         else:
             self._paused = True
             self._pause_event.clear()
-            play_beep_pause(self._config.beep_volume)
+            play_beep_pause(self._config)
             GLib.idle_add(self._on_partial, "Paused")
 
     def _run(self):
         try:
             self._ensure_models()
         except Exception as e:
+            self._running = False
             GLib.idle_add(self._on_error, str(e))
             return
 
         is_streaming = self._profile.get("streaming", False)
-        self._running = True
 
         try:
-            if is_streaming:
+            if self._profile.get("backend") == "gemini":
+                self._run_gemini()
+            elif is_streaming:
                 self._run_streaming()
             else:
                 self._run_offline()
         except Exception as e:
-            GLib.idle_add(self._on_error, str(e))
+            GLib.idle_add(self._on_error, short_error(e))
         finally:
             self._running = False
-            play_beep_stop(self._config.beep_volume)
+            play_beep_stop(self._config)
+
+    def _on_audio(self, indata, _frames, _time, _status):
+        """PortAudio callback — never blocked by decoding; the queue
+        absorbs any backlog.  (The blocking read() path held only ~0.4s
+        and dropped overrun silently, eating the words after a decode
+        stall.)  The lock only guards routing flips; it is held for
+        microseconds."""
+        chunk = indata.reshape(-1).copy()
+        with self._route_lock:
+            if self._capturing:
+                self._audio_q.put(chunk)
+            else:
+                self._preroll_ring.append(chunk)
+
+    def _ensure_mic(self):
+        """Open the persistent input stream; reopen on device change."""
+        with self._mic_lock:
+            device = resolve_audio_device(self._config.audio_device)
+            if self._mic_stream is not None:
+                if self._mic_dev == device and self._mic_stream.active:
+                    return
+                try:
+                    self._mic_stream.close()
+                except Exception:
+                    pass
+                self._mic_stream = None
+            stream = sd.InputStream(
+                device=device, channels=1, dtype="float32",
+                samplerate=SAMPLE_RATE, blocksize=CHUNK_SAMPLES,
+                callback=self._on_audio,
+            )
+            stream.start()
+            self._mic_stream = stream
+            self._mic_dev = device
+
+    def _begin_capture(self) -> queue.Queue:
+        """Route mic audio into a fresh queue, pre-press ring first."""
+        self._ensure_mic()
+        q: queue.Queue = queue.Queue()
+        with self._route_lock:
+            while self._preroll_ring:
+                q.put(self._preroll_ring.popleft())
+            self._audio_q = q
+            self._capturing = True
+        return q
+
+    def _end_capture(self):
+        with self._route_lock:
+            self._capturing = False
+
+    def close(self):
+        """Release the mic — call before dropping the engine."""
+        self.stop()
+        with self._mic_lock:
+            if self._mic_stream is not None:
+                try:
+                    self._mic_stream.close()
+                except Exception:
+                    pass
+                self._mic_stream = None
+
+    def _drain(self, audio_q) -> list:
+        """Pop everything currently queued (used for pause/stop)."""
+        chunks = []
+        while True:
+            try:
+                chunks.append(audio_q.get_nowait())
+            except queue.Empty:
+                return chunks
+
+    @staticmethod
+    def _decode_once(recognizer, samples: list) -> str:
+        s = recognizer.create_stream()
+        s.accept_waveform(SAMPLE_RATE, samples)
+        recognizer.decode_stream(s)
+        return s.result.text.strip()
+
+    def _decode_piece(self, recognizer, samples: list) -> str:
+        """Decode one piece, nudging the audio if it comes back blank.
+
+        A blank is not always silence.  The same audio that decodes to
+        nothing decodes fine with 0.5 s of tail silence, or at 70 % gain —
+        the model is on a numerical knife edge, and per-utterance feature
+        normalisation couples the whole input, so either nudge moves it off.
+        """
+        text = self._decode_once(recognizer, samples)
+        if not text:
+            text = self._decode_once(recognizer, samples + [0.0] * (SAMPLE_RATE // 2))
+            if text:
+                log_history("decode: blank recovered on tail-silence retry")
+        if not text:
+            text = self._decode_once(recognizer, [v * 0.7 for v in samples])
+            if text:
+                log_history("decode: blank recovered on gain retry")
+        return text
+
+    def _decode_pending(self, recognizer, vad):
+        """Transcribe every completed VAD segment and emit its text."""
+        while not vad.empty():
+            samples = vad.front.samples
+            pieces = split_for_decode(samples)
+            text = " ".join(t for t in
+                            (self._decode_piece(recognizer, p) for p in pieces) if t)
+            log_history(f"segment: {len(samples) / SAMPLE_RATE:.1f}s"
+                        f"{f' in {len(pieces)} pieces' if len(pieces) > 1 else ''} "
+                        f"-> {text!r}")
+            if text:
+                GLib.idle_add(self._on_text, text)
+            vad.pop()
 
     def _run_offline(self):
-        recognizer = self._build_offline_recognizer()
-        vad = self._build_vad()
-        chunk_duration = 0.1
-        samples_per_chunk = int(SAMPLE_RATE * chunk_duration)
-
-        device = resolve_audio_device(self._config.audio_device)
-        with sd.InputStream(
-            device=device, channels=1, dtype="float32", samplerate=SAMPLE_RATE,
-            blocksize=samples_per_chunk,
-        ) as stream:
-            play_beep_start(self._config.beep_volume)
+        audio_q = self._begin_capture()
+        # ponytail: keeps last 10 min in RAM (~37 MB); ring covers any session
+        session = deque(maxlen=int(600 / CHUNK_SECS))
+        log_history("--- session start ---")
+        try:
+            play_beep_start(self._config)
             GLib.idle_add(self._on_partial, "")
+            # Fetched after capture starts: a cold model load (seconds)
+            # then delays the first text, but loses no audio.
+            recognizer = self._get_recognizer()
+            vad = self._build_vad()
 
             while not self._stop_event.is_set():
                 self._pause_event.wait(timeout=0.1)
                 if self._stop_event.is_set():
                     break
                 if self._paused:
+                    self._drain(audio_q)  # discard mic audio while paused
                     continue
 
-                audio, overflowed = stream.read(samples_per_chunk)
-                if overflowed:
+                try:
+                    audio = audio_q.get(timeout=0.1)
+                except queue.Empty:
                     continue
-                samples = audio.reshape(-1).tolist()
-                vad.accept_waveform(samples)
+                session.append(audio)
+                vad.accept_waveform(audio.tolist())
 
                 if vad.is_speech_detected():
                     GLib.idle_add(self._on_partial, "Listening...")
 
-                while not vad.empty():
-                    segment = vad.front
-                    s = recognizer.create_stream()
-                    s.accept_waveform(SAMPLE_RATE, segment.samples)
-                    recognizer.decode_stream(s)
-                    text = s.result.text.strip()
-                    if text:
-                        GLib.idle_add(self._on_text, text)
-                    vad.pop()
+                self._decode_pending(recognizer, vad)
 
-            # Flush remaining
+            # Feed audio captured but not yet consumed, then flush
+            self._end_capture()
+            for audio in self._drain(audio_q):
+                session.append(audio)
+                vad.accept_waveform(audio.tolist())
             vad.flush()
-            while not vad.empty():
-                segment = vad.front
-                s = recognizer.create_stream()
-                s.accept_waveform(SAMPLE_RATE, segment.samples)
-                recognizer.decode_stream(s)
-                text = s.result.text.strip()
-                if text:
-                    GLib.idle_add(self._on_text, text)
-                vad.pop()
+            self._decode_pending(recognizer, vad)
+        finally:
+            self._end_capture()
+            wav = save_session_wav(session)
+            log_history(f"--- session end ({len(session) * CHUNK_SECS:.1f}s "
+                        f"audio -> {wav.name if wav else 'none'}) ---")
 
     def _run_streaming(self):
-        recognizer = self._build_online_recognizer()
-        stream = recognizer.create_stream()
-        chunk_duration = 0.1
-        samples_per_chunk = int(SAMPLE_RATE * chunk_duration)
-        partial_overwrite = self._config.partial_overwrite
-
-        device = resolve_audio_device(self._config.audio_device)
-        with sd.InputStream(
-            device=device, channels=1, dtype="float32", samplerate=SAMPLE_RATE,
-            blocksize=samples_per_chunk,
-        ) as mic:
-            play_beep_start(self._config.beep_volume)
+        audio_q = self._begin_capture()
+        session = deque(maxlen=int(600 / CHUNK_SECS))
+        log_history("--- session start ---")
+        try:
+            play_beep_start(self._config)
             GLib.idle_add(self._on_partial, "")
+            recognizer = self._get_recognizer()
+            stream = recognizer.create_stream()
+            partial_overwrite = self._config.partial_overwrite
 
             while not self._stop_event.is_set():
                 self._pause_event.wait(timeout=0.1)
                 if self._stop_event.is_set():
                     break
                 if self._paused:
+                    self._drain(audio_q)  # discard mic audio while paused
                     continue
 
-                audio, overflowed = mic.read(samples_per_chunk)
-                if overflowed:
+                try:
+                    audio = audio_q.get(timeout=0.1)
+                except queue.Empty:
                     continue
-                samples = audio.reshape(-1).tolist()
-                stream.accept_waveform(SAMPLE_RATE, samples)
+                session.append(audio)
+                stream.accept_waveform(SAMPLE_RATE, audio.tolist())
 
                 while recognizer.is_ready(stream):
                     recognizer.decode_stream(stream)
@@ -690,7 +1136,9 @@ class ASREngine:
                 if partial:
                     GLib.idle_add(self._on_partial, partial)
                     if partial_overwrite:
-                        GLib.idle_add(self._on_partial_type, partial)
+                        self._partial_seq += 1
+                        GLib.idle_add(self._emit_partial_type,
+                                      self._partial_seq, partial)
 
                 if recognizer.is_endpoint(stream):
                     text = recognizer.get_result(stream).strip()
@@ -700,6 +1148,128 @@ class ASREngine:
                         else:
                             GLib.idle_add(self._on_text, text)
                     recognizer.reset(stream)
+        finally:
+            self._end_capture()
+            wav = save_session_wav(session)
+            log_history(f"--- session end ({len(session) * CHUNK_SECS:.1f}s "
+                        f"audio -> {wav.name if wav else 'none'}) ---")
+
+    # -- Gemini Live (cloud) ------------------------------------------------
+
+    def _run_gemini(self):
+        audio_q = self._begin_capture()
+        session = deque(maxlen=int(600 / CHUNK_SECS))
+        log_history("--- session start (gemini) ---")
+        try:
+            play_beep_start(self._config)
+            GLib.idle_add(self._on_partial, "")
+            asyncio.run(self._gemini_loop(audio_q, session))
+        finally:
+            self._end_capture()
+            wav = save_session_wav(session)
+            log_history(f"--- session end ({len(session) * CHUNK_SECS:.1f}s "
+                        f"audio -> {wav.name if wav else 'none'}) ---")
+
+    async def _gemini_loop(self, audio_q, session):
+        from google import genai
+        from google.genai import types
+        key = self._config.gemini_api_key.strip()
+        if not key:
+            raise RuntimeError("Gemini API key not set (Settings > General)")
+        client = genai.Client(api_key=key)
+        # ponytail: the replacement targets double as vocabulary hints; a
+        # separate vocabulary list can come when someone asks for it.
+        vocab = list(self._config.word_replacements.values())[:1000]
+        cfg = types.LiveConnectConfig(
+            response_modalities=["TEXT"],
+            input_audio_transcription=types.AudioTranscriptionConfig(
+                mode=self._profile.get("transcription_mode", "SMART"),
+                custom_vocabulary=vocab or None,
+            ),
+        )
+        while not self._stop_event.is_set():
+            async with client.aio.live.connect(
+                    model=self._profile["model_id"], config=cfg) as live:
+                await self._gemini_session(live, types, audio_q, session)
+
+    async def _gemini_session(self, live, types, audio_q, session):
+        """Pump mic chunks up and transcripts down until stop or the
+        session deadline; the caller reconnects for the next stretch."""
+        deadline = time.monotonic() + GEMINI_SESSION_SECS
+        partial_overwrite = self._config.partial_overwrite
+        # Turn detection is the server's: it groups sentences by real
+        # pauses and finalizes ~1 s after speech.  Ending turns on the
+        # local pause setting (0.25 s) chopped sentences at breaths, and
+        # the interims already have the words on screen by then.
+
+        async def push(audio):
+            session.append(audio)
+            await live.send_realtime_input(audio=types.Blob(
+                data=pcm16(audio), mime_type=f"audio/pcm;rate={SAMPLE_RATE}"))
+
+        async def send():
+            while not self._stop_event.is_set() and time.monotonic() < deadline:
+                if self._paused:
+                    self._drain(audio_q)  # discard mic audio while paused
+                    await asyncio.sleep(0.1)
+                    continue
+                try:
+                    audio = audio_q.get_nowait()
+                except queue.Empty:
+                    await asyncio.sleep(0.02)
+                    continue
+                await push(audio)
+            if self._stop_event.is_set():
+                self._end_capture()
+                for audio in self._drain(audio_q):
+                    await push(audio)
+            self._gem_final.clear()
+            await live.send_realtime_input(audio_stream_end=True)
+
+        async def recv():
+            async for msg in live.receive():
+                self._handle_gemini_event(msg.server_content, partial_overwrite)
+
+        self._gem_final = asyncio.Event()
+        recv_task = asyncio.ensure_future(recv())
+        await send()
+        # The stream-end final takes ~0.3 s; receive() itself never ends
+        # (the server keeps the socket open), so wait for the final, and
+        # only if speech is still unfinalized.
+        if self._gem_pending:
+            try:
+                await asyncio.wait_for(self._gem_final.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+        recv_task.cancel()
+
+    def _handle_gemini_event(self, sc, partial_overwrite: bool):
+        """Route one server_content into the same callbacks the local
+        streaming path uses.  Interims are the cumulative hypothesis for
+        the current utterance (~0.5 s cadence, ~1 s behind speech); the
+        final is that utterance in full.
+        """
+        if not sc:
+            return
+        interim = getattr(sc, "interim_input_transcription", None)
+        text = ((interim.text if interim else "") or "").strip()
+        if text:
+            self._gem_pending = True
+            GLib.idle_add(self._on_partial, text)
+            if partial_overwrite:
+                self._partial_seq += 1
+                GLib.idle_add(self._emit_partial_type, self._partial_seq, text)
+        final = getattr(sc, "input_transcription", None)
+        text = ((final.text if final else "") or "").strip()
+        if text:
+            self._gem_pending = False
+            if self._gem_final is not None:
+                self._gem_final.set()
+            log_history(f"gemini final -> {text!r}")
+            if partial_overwrite:
+                GLib.idle_add(self._on_commit_partial, text)
+            else:
+                GLib.idle_add(self._on_text, text)
 
 
 # ---------------------------------------------------------------------------
@@ -716,9 +1286,14 @@ class DictationController:
         self._rebuild_engine()
 
     def _rebuild_engine(self):
+        if self._engine is not None:
+            self._engine.close()  # release the persistent mic before swapping
         profile = self._profiles_data["profiles"].get(self._config.model_profile)
         if not profile:
             profile = self._profiles_data["profiles"]["desktop"]
+        # Callers mutate the shared config object before apply_config, so a
+        # change can only be detected against the profile the engine holds.
+        self._engine_profile = self._config.model_profile
         self._engine = ASREngine(
             self._config, profile,
             on_text=self._on_final_text,
@@ -730,7 +1305,6 @@ class DictationController:
 
     def set_status_callback(self, cb):
         self._status_callback = cb
-
 
     @property
     def is_running(self) -> bool:
@@ -758,7 +1332,10 @@ class DictationController:
 
     def stop(self):
         self._engine.stop()
-        self._typer.reset_partial()
+        # Queued, not direct: a cloud final can still be waiting in the idle
+        # queue after stop; resetting first made its commit retype the
+        # whole sentence after the on-screen partial.
+        GLib.idle_add(self._typer.reset_partial)
         if self._status_callback:
             self._status_callback("")
 
@@ -768,40 +1345,50 @@ class DictationController:
         else:
             self.start()
 
-    def pause(self):
-        self._engine.pause()
+    def toggle_pause(self):
+        self._engine.toggle_pause()
+
+    def switch_model(self, model_id: str):
+        self._config.model_profile = model_id
+        self.apply_config(self._config)
 
     def apply_config(self, new_config: AppConfig):
         was_running = self._engine.is_running
         if was_running:
             self._engine.stop()
-        old_profile = self._config.model_profile
         self._config = new_config
         self._config.save()
         self._typer = TextTyper(new_config.typer)
-        if new_config.model_profile != old_profile or was_running:
+        if new_config.model_profile != self._engine_profile or was_running:
             self._rebuild_engine()
 
-    def _on_final_text(self, text: str):
+    def _postprocess(self, text: str) -> str:
         if self._config.filter_fillers:
-            text = filter_fillers(text)
+            text = strip_fillers(text)
+        return apply_word_replacements(text, self._config.word_replacements)
+
+    def _on_final_text(self, text: str):
+        raw = text
+        text = self._postprocess(text)
         if not text:
+            log_history(f"heard (filtered out): {raw}")
             return
+        log_history(f"typed: {text}")
         self._typer.type_text(text)
         if self._status_callback:
             self._status_callback("")
 
     def _on_partial_type(self, text: str):
         """Type a streaming partial into the active window (overwrite prev)."""
-        if self._config.filter_fillers:
-            text = filter_fillers(text)
+        text = self._postprocess(text)
         if text:
             self._typer.type_partial(text)
 
     def _on_commit_partial(self, text: str):
         """Commit the streaming partial as final text."""
-        if self._config.filter_fillers:
-            text = filter_fillers(text)
+        raw = text
+        text = self._postprocess(text)
+        log_history(f"typed: {text}" if text else f"heard (filtered out): {raw}")
         self._typer.commit_partial(text)
         if self._status_callback:
             self._status_callback("")
@@ -811,7 +1398,11 @@ class DictationController:
             self._status_callback(text)
 
     def _on_error(self, msg: str):
+        log_history(f"ERROR: {msg}")
         print(f"ERROR: {msg}", file=sys.stderr)
+        # Into the window, replacing any half-typed partial: a rate limit
+        # or dead connection is otherwise invisible while dictating.
+        self._typer.commit_partial(f"[{msg}]")
         if self._status_callback:
             self._status_callback(f"Error: {msg[:60]}")
 
@@ -829,6 +1420,28 @@ class HotkeyManager:
         self._on_pause = on_pause
         self._listener = None
 
+    @staticmethod
+    def _debounce(fn, gap: float = 1.0):
+        """One activation per hotkey press, however long it is held.
+
+        X11 auto-repeat re-delivers a held key as release+press pulses
+        (~33/s after a ~0.5s delay) and pynput re-activates on every
+        pulse — each re-fire toggled dictation off right after it
+        started.  Fire only when the previous pulse is at least *gap*
+        old; every suppressed pulse re-arms the window, so pulses 30ms
+        apart never fire no matter how long the key is held.
+        """
+        last = [None]
+
+        def wrapper():
+            now = time.monotonic()
+            prev = last[0]
+            last[0] = now
+            if prev is None or now - prev >= gap:
+                fn()
+
+        return wrapper
+
     def start(self):
         from pynput import keyboard
         bindings = {}
@@ -841,6 +1454,7 @@ class HotkeyManager:
         if self._config.hotkey_pause:
             bindings[self._config.hotkey_pause] = lambda: GLib.idle_add(self._on_pause)
 
+        bindings = {key: self._debounce(fn) for key, fn in bindings.items()}
         self._listener = keyboard.GlobalHotKeys(bindings)
         self._listener.daemon = True
         self._listener.start()
@@ -886,8 +1500,22 @@ class HotkeyCaptureButton(Gtk.Button):
     def _on_key(self, _widget, event):
         if not self._capturing:
             return False
+
+        # A modifier press alone must NOT end capture — keep waiting
+        # for the main key (fixes capturing e.g. Ctrl+E).
+        keyname = Gdk.keyval_name(event.keyval).lower()
+        if keyname in ("control_l", "control_r", "alt_l", "alt_r",
+                       "shift_l", "shift_r", "super_l", "super_r",
+                       "meta_l", "meta_r"):
+            return True
+
         self._capturing = False
         self.get_toplevel().disconnect(self._key_handler)
+
+        if keyname == "escape":
+            # Escape cancels capture and keeps the old binding
+            self.set_label(self._display(self._binding))
+            return True
 
         parts = []
         if event.state & Gdk.ModifierType.CONTROL_MASK:
@@ -896,16 +1524,27 @@ class HotkeyCaptureButton(Gtk.Button):
             parts.append("<alt>")
         if event.state & Gdk.ModifierType.SHIFT_MASK:
             parts.append("<shift>")
+        if event.state & Gdk.ModifierType.SUPER_MASK:
+            parts.append("<cmd>")  # pynput's name for the Super/Win key
 
-        keyname = Gdk.keyval_name(event.keyval).lower()
-        if keyname in ("control_l", "control_r", "alt_l", "alt_r",
-                       "shift_l", "shift_r", "super_l", "super_r",
-                       "meta_l", "meta_r"):
+        # GDK key names pynput spells differently
+        keyname = {"return": "enter", "kp_enter": "enter", "prior": "page_up",
+                   "next": "page_down", "print": "print_screen"}.get(keyname, keyname)
+        # pynput wants special keys angle-bracketed ("<f9>", "<pause>");
+        # a bare multi-char name makes GlobalHotKeys raise and kills all
+        # hotkeys on the next rebuild.
+        parts.append(keyname if len(keyname) == 1 else f"<{keyname}>")
+
+        binding = "+".join(parts)
+        from pynput.keyboard import HotKey
+        try:
+            HotKey.parse(binding)
+        except ValueError:
+            # Key unknown to pynput — reject capture, keep old binding
             self.set_label(self._display(self._binding))
             return True
 
-        parts.append(keyname)
-        self._binding = "+".join(parts)
+        self._binding = binding
         self.set_label(self._display(self._binding))
         return True
 
@@ -916,8 +1555,8 @@ class HotkeyCaptureButton(Gtk.Button):
 
 def _any_model_downloaded(profiles: dict) -> bool:
     """Check if at least one model is downloaded."""
-    for mid in profiles:
-        if _is_model_downloaded(mid, profiles):
+    for mid, profile in profiles.items():
+        if profile.get("files") and _is_model_downloaded(mid, profiles):
             return True
     return False
 
@@ -956,100 +1595,36 @@ def _download_file(url: str, dest: Path, on_progress_bytes=None):
         raise
 
 
-def _ensure_vad(profiles_data: dict, on_progress_bytes=None):
-    """Download the VAD model if not present."""
-    vad = profiles_data.get("vad")
-    if not vad:
-        return
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    dest = MODELS_DIR / vad["filename"]
-    if dest.exists() and dest.stat().st_size > 0:
-        return
-    _download_file(vad["url"], dest, on_progress_bytes)
-
-
-def _download_model(model_id: str, profiles_data: dict, on_progress, on_done):
-    """Download a model in a background thread."""
+def _download_models(model_ids: list, profiles_data: dict, on_progress, on_done):
+    """Download the given models sequentially in a background thread."""
 
     def _worker():
         try:
-            profile = profiles_data["profiles"][model_id]
-            model_dir = MODELS_DIR / model_id
-            model_dir.mkdir(parents=True, exist_ok=True)
-
-            # Download VAD first
-            def _vad_progress(done, total):
-                if total:
-                    mb = done / 1024 / 1024
-                    total_mb = total / 1024 / 1024
-                    GLib.idle_add(on_progress, f"VAD: {mb:.0f}/{total_mb:.0f} MB", -1.0)
-            _ensure_vad(profiles_data, _vad_progress)
-
-            # Download model files
-            files = profile["files"]
-            total_files = len(files)
-            for i, (key, info) in enumerate(files.items(), 1):
-                dest = model_dir / info["filename"]
-                if dest.exists() and dest.stat().st_size > 0:
-                    continue
-
-                def _file_progress(done, total, fname=info["filename"], idx=i):
-                    if total:
-                        frac = done / total
-                        mb = done / 1024 / 1024
-                        total_mb = total / 1024 / 1024
-                        GLib.idle_add(
-                            on_progress,
-                            f"{fname} ({idx}/{total_files}): {mb:.0f}/{total_mb:.0f} MB",
-                            frac,
-                        )
-                    else:
-                        mb = done / 1024 / 1024
-                        GLib.idle_add(on_progress, f"{fname}: {mb:.0f} MB", -1.0)
-
-                _download_file(info["url"], dest, _file_progress)
-
-            GLib.idle_add(on_done, True, "")
-        except Exception as e:
-            GLib.idle_add(on_done, False, str(e))
-
-    threading.Thread(target=_worker, daemon=True).start()
-
-
-def _download_all_models(profiles_data: dict, on_progress, on_done):
-    """Download all models sequentially in a background thread."""
-
-    def _worker():
-        try:
-            # Download VAD first
-            def _vad_progress(done, total):
-                if total:
-                    mb = done / 1024 / 1024
-                    total_mb = total / 1024 / 1024
-                    GLib.idle_add(on_progress, f"VAD: {mb:.0f}/{total_mb:.0f} MB", -1.0)
-            _ensure_vad(profiles_data, _vad_progress)
-
             profiles = profiles_data["profiles"]
-            for mid, profile in profiles.items():
+            for mid in model_ids:
+                profile = profiles[mid]
                 model_dir = MODELS_DIR / mid
                 model_dir.mkdir(parents=True, exist_ok=True)
                 files = profile["files"]
                 total_files = len(files)
-                for i, (key, info) in enumerate(files.items(), 1):
+                prefix = f"{profile['name'][:18]}: " if len(model_ids) > 1 else ""
+                for i, info in enumerate(files.values(), 1):
                     dest = model_dir / info["filename"]
                     if dest.exists() and dest.stat().st_size > 0:
                         continue
-                    short_name = profile["name"][:18]
 
-                    def _file_progress(done, total, sn=short_name, fname=info["filename"], idx=i, tf=total_files):
+                    def _file_progress(done, total, p=prefix,
+                                       fname=info["filename"], idx=i):
+                        mb = done / 1024 / 1024
                         if total:
-                            frac = done / total
-                            mb = done / 1024 / 1024
-                            total_mb = total / 1024 / 1024
-                            GLib.idle_add(on_progress, f"{sn}: {fname} {mb:.0f}/{total_mb:.0f} MB", frac)
+                            GLib.idle_add(
+                                on_progress,
+                                f"{p}{fname} ({idx}/{total_files}): "
+                                f"{mb:.0f}/{total / 1024 / 1024:.0f} MB",
+                                done / total,
+                            )
                         else:
-                            mb = done / 1024 / 1024
-                            GLib.idle_add(on_progress, f"{sn}: {fname} {mb:.0f} MB", -1.0)
+                            GLib.idle_add(on_progress, f"{p}{fname}: {mb:.0f} MB", -1.0)
 
                     _download_file(info["url"], dest, _file_progress)
             GLib.idle_add(on_done, True, "")
@@ -1088,7 +1663,7 @@ class WelcomeDialog(Gtk.Dialog):
         header.set_halign(Gtk.Align.START)
         box.pack_start(header, False, False, 0)
 
-        total_mb = sum(m["size_mb"] for m in self._profiles.values())
+        total_mb = sum(m.get("size_mb", 0) for m in self._profiles.values())
         subtitle = Gtk.Label()
         subtitle.set_markup(
             f"Three speech recognition models will be downloaded\n"
@@ -1104,7 +1679,7 @@ class WelcomeDialog(Gtk.Dialog):
             lbl = Gtk.Label()
             tag = "Streaming" if mdata.get("streaming") else "VAD-segmented"
             lbl.set_markup(
-                f"  \u2022 <b>{mdata['name']}</b>  ({mdata['size_mb']} MB, {tag})"
+                f"  \u2022 <b>{mdata['name']}</b>  ({mdata.get("size_mb", 0)} MB, {tag})"
             )
             lbl.set_halign(Gtk.Align.START)
             lbl.get_style_context().add_class("dim-label")
@@ -1170,7 +1745,8 @@ class WelcomeDialog(Gtk.Dialog):
                 self._error_label.show()
                 print(f"Download error: {err}", file=sys.stderr)
 
-        _download_all_models(self._profiles_data, on_progress, on_done)
+        _download_models(list(self._profiles), self._profiles_data,
+                         on_progress, on_done)
 
 
 class SettingsDialog(Gtk.Dialog):
@@ -1220,7 +1796,7 @@ class SettingsDialog(Gtk.Dialog):
             Gtk.Image.new_from_icon_name("folder-download-symbolic", Gtk.IconSize.BUTTON),
             False, False, 0,
         )
-        total_mb = sum(m["size_mb"] for m in self._profiles.values())
+        total_mb = sum(m.get("size_mb", 0) for m in self._profiles.values())
         self._dl_all_label = Gtk.Label(label=f"Download All Models ({total_mb} MB)")
         dl_all_hbox.pack_start(self._dl_all_label, False, False, 0)
         self._dl_all_btn.add(dl_all_hbox)
@@ -1280,7 +1856,9 @@ class SettingsDialog(Gtk.Dialog):
             rec = mdata.get("recommended_for", "")
             hw = mdata.get("hardware_label", "CPU")
             langs = mdata.get("languages")
-            tag_parts = [f"{mdata['params']} params", f"{mdata['size_mb']} MB", hw]
+            tag_parts = [t for t in (
+                mdata.get("params") and f"{mdata['params']} params",
+                mdata.get("size_mb") and f"{mdata['size_mb']} MB", hw) if t]
             if rec:
                 tag_parts.append(rec)
             if langs:
@@ -1361,7 +1939,7 @@ class SettingsDialog(Gtk.Dialog):
                 self._dl_error.show()
                 print(f"Download error: {err}", file=sys.stderr)
 
-        _download_model(model_id, self._profiles_data, on_progress, on_done)
+        _download_models([model_id], self._profiles_data, on_progress, on_done)
 
     def _on_download_all(self, _btn):
         self._dl_all_btn.set_sensitive(False)
@@ -1382,7 +1960,8 @@ class SettingsDialog(Gtk.Dialog):
                 self._dl_error.show()
                 print(f"Download error: {err}", file=sys.stderr)
 
-        _download_all_models(self._profiles_data, on_progress, on_done)
+        _download_models(list(self._profiles), self._profiles_data,
+                         on_progress, on_done)
 
     # --- Hotkeys tab ---
 
@@ -1474,6 +2053,7 @@ class SettingsDialog(Gtk.Dialog):
         hbox_typer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         hbox_typer.pack_start(Gtk.Label(label="Typing method:"), False, False, 0)
         self._typer_combo = Gtk.ComboBoxText()
+        self._typer_combo.append("xdotool", "xdotool type (X11)")
         self._typer_combo.append("clipboard", "Clipboard paste (recommended)")
         self._typer_combo.append("wtype", "wtype (GNOME/Sway only)")
         self._typer_combo.append("ydotool", "ydotool (needs daemon+uinput)")
@@ -1513,6 +2093,42 @@ class SettingsDialog(Gtk.Dialog):
         hbox_lang.pack_start(lang_hint, False, False, 0)
         box.pack_start(hbox_lang, False, False, 0)
 
+        # Pause length that ends a chunk and triggers transcription
+        hbox_pause = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        hbox_pause.pack_start(Gtk.Label(label="Transcribe after a pause of:"), False, False, 0)
+        self._pause_spin = Gtk.SpinButton.new_with_range(0, 30, 0.25)
+        self._pause_spin.set_value(self._config.pause_secs)
+        hbox_pause.pack_start(self._pause_spin, False, False, 0)
+        hbox_pause.pack_start(Gtk.Label(label="seconds"), False, False, 0)
+        box.pack_start(hbox_pause, False, False, 0)
+        pause_hint = Gtk.Label()
+        pause_hint.set_markup(
+            "<small>0 = never — everything you say is transcribed as one "
+            "chunk when you stop recording.</small>")
+        pause_hint.get_style_context().add_class("dim-label")
+        pause_hint.set_halign(Gtk.Align.START)
+        pause_hint.set_line_wrap(True)
+        pause_hint.set_max_width_chars(60)
+        box.pack_start(pause_hint, False, False, 0)
+
+        # Max continuous-speech duration before a forced transcription cut
+        hbox_chunk = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        hbox_chunk.pack_start(Gtk.Label(label="Transcribe after:"), False, False, 0)
+        self._chunk_spin = Gtk.SpinButton.new_with_range(0, 3600, 5)
+        self._chunk_spin.set_value(self._config.max_speech_secs)
+        hbox_chunk.pack_start(self._chunk_spin, False, False, 0)
+        hbox_chunk.pack_start(Gtk.Label(label="seconds of nonstop speech"), False, False, 0)
+        box.pack_start(hbox_chunk, False, False, 0)
+        chunk_hint = Gtk.Label()
+        chunk_hint.set_markup(
+            "<small>Speaking without pausing is cut into chunks this long. "
+            "Set 0 to never cut — text appears when you pause or stop recording.</small>")
+        chunk_hint.get_style_context().add_class("dim-label")
+        chunk_hint.set_halign(Gtk.Align.START)
+        chunk_hint.set_line_wrap(True)
+        chunk_hint.set_max_width_chars(60)
+        box.pack_start(chunk_hint, False, False, 0)
+
         # Streaming options
         sep_stream = Gtk.Separator()
         sep_stream.set_margin_top(4)
@@ -1530,6 +2146,36 @@ class SettingsDialog(Gtk.Dialog):
             label="Filter filler words (um, uh, ehm …)")
         self._filter_fillers_check.set_active(self._config.filter_fillers)
         box.pack_start(self._filter_fillers_check, False, False, 4)
+
+        repl_label = Gtk.Label(label="Word replacements (one per line, spoken=typed):",
+                               xalign=0)
+        box.pack_start(repl_label, False, False, 0)
+        self._repl_view = Gtk.TextView()
+        self._repl_view.set_tooltip_text(
+            "Whole-word, case-insensitive replacements applied to transcribed "
+            "text.  Example line:  herder=herdr")
+        self._repl_view.get_buffer().set_text(
+            "\n".join(f"{k}={v}" for k, v in self._config.word_replacements.items()))
+        repl_scroll = Gtk.ScrolledWindow()
+        repl_scroll.set_min_content_height(70)
+        repl_scroll.set_shadow_type(Gtk.ShadowType.IN)
+        repl_scroll.add(self._repl_view)
+        box.pack_start(repl_scroll, False, False, 4)
+
+        # Cloud
+        sep_cloud = Gtk.Separator()
+        sep_cloud.set_margin_top(4)
+        box.pack_start(sep_cloud, False, False, 0)
+        key_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        key_box.pack_start(Gtk.Label(label="Gemini API key:"), False, False, 0)
+        self._gemini_key_entry = Gtk.Entry()
+        self._gemini_key_entry.set_visibility(False)
+        self._gemini_key_entry.set_text(self._config.gemini_api_key)
+        self._gemini_key_entry.set_tooltip_text(
+            "Used by the Gemini 3.5 Transcribe (cloud) model.  "
+            "Create one at aistudio.google.com/apikey")
+        key_box.pack_start(self._gemini_key_entry, True, True, 0)
+        box.pack_start(key_box, False, False, 4)
 
         # Night mode
         sep = Gtk.Separator()
@@ -1560,18 +2206,26 @@ class SettingsDialog(Gtk.Dialog):
         return box
 
     def _save_general(self, _btn):
-        global _active_config
         self._config.audio_device = self._mic_combo.get_active_id() or ""
         self._config.typer = self._typer_combo.get_active_id() or "wtype"
         self._config.beep_volume = self._vol_scale.get_value()
         self._config.num_threads = int(self._threads_spin.get_value())
         self._config.language = self._lang_combo.get_active_id() or "en"
+        self._config.max_speech_secs = self._chunk_spin.get_value()
+        self._config.pause_secs = self._pause_spin.get_value()
         self._config.partial_overwrite = self._partial_overwrite_check.get_active()
         self._config.filter_fillers = self._filter_fillers_check.get_active()
+        buf = self._repl_view.get_buffer()
+        raw = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+        self._config.word_replacements = {
+            k.strip(): v.strip()
+            for k, _, v in (line.partition("=") for line in raw.splitlines())
+            if k.strip() and v.strip()
+        }
+        self._config.gemini_api_key = self._gemini_key_entry.get_text().strip()
         self._config.night_mode = self._night_check.get_active()
         self._config.night_start = int(self._night_start_spin.get_value())
         self._config.night_end = int(self._night_end_spin.get_value())
-        _active_config = self._config
         self._config.save()
         if self._on_save:
             self._on_save(self._config)
@@ -1630,10 +2284,10 @@ class SettingsDialog(Gtk.Dialog):
 # ---------------------------------------------------------------------------
 
 class MainWindow(Gtk.Window):
-    def __init__(self, controller: DictationController, hotkey_mgr: HotkeyManager):
+    def __init__(self, controller: DictationController):
         super().__init__(title=APP_NAME)
         self._controller = controller
-        self._hotkey_mgr = hotkey_mgr
+        self.tray_refresh = lambda: None  # set by main once the tray exists
         self.set_default_size(480, -1)
         self.set_resizable(False)
         self.set_icon_name("audio-input-microphone")
@@ -1663,7 +2317,7 @@ class MainWindow(Gtk.Window):
 
         self._pause_btn = Gtk.Button(label="Pause")
         self._pause_btn.set_sensitive(False)
-        self._pause_btn.connect("clicked", lambda _: self._controller.pause())
+        self._pause_btn.connect("clicked", lambda _: self._controller.toggle_pause())
         btn_box.pack_start(self._pause_btn, False, False, 0)
 
         vbox.pack_start(btn_box, False, False, 0)
@@ -1736,10 +2390,7 @@ class MainWindow(Gtk.Window):
         if not _is_model_downloaded(model_id, self._controller.profiles):
             self._model_combo.set_active_id(self._controller.config.model_profile)
             return
-        new_config = self._controller.config
-        new_config.model_profile = model_id
-        self._controller.apply_config(new_config)
-        self._hotkey_mgr.rebuild(new_config)
+        self._controller.switch_model(model_id)
         # Keep streaming checkbox in sync
         is_streaming = self._controller.profiles.get(model_id, {}).get("streaming", False)
         self._streaming_check.handler_block_by_func(self._on_streaming_toggled)
@@ -1747,9 +2398,7 @@ class MainWindow(Gtk.Window):
         self._streaming_check.handler_unblock_by_func(self._on_streaming_toggled)
         if not is_streaming:
             self._non_streaming_model = model_id
-        if hasattr(self, "_tray") and self._tray:
-            self._tray._build_menu()
-            self._tray.update_ui()
+        self.tray_refresh()
 
     def _on_streaming_toggled(self, check):
         if check.get_active():
@@ -1770,15 +2419,10 @@ class MainWindow(Gtk.Window):
             check.handler_unblock_by_func(self._on_streaming_toggled)
             return
 
-        new_config = self._controller.config
-        new_config.model_profile = target
-        self._controller.apply_config(new_config)
-        self._hotkey_mgr.rebuild(new_config)
+        self._controller.switch_model(target)
         # Sync the model combo
         self._model_combo.set_active_id(target)
-        if hasattr(self, "_tray") and self._tray:
-            self._tray._build_menu()
-            self._tray.update_ui()
+        self.tray_refresh()
 
     def _update_controls(self):
         running = self._controller.is_running
@@ -1852,7 +2496,7 @@ class TrayIcon:
         menu.append(self._toggle_item)
 
         self._pause_item = Gtk.MenuItem(label=f"Pause ({cfg.hotkey_pause})")
-        self._pause_item.connect("activate", lambda _: self._controller.pause())
+        self._pause_item.connect("activate", lambda _: self._controller.toggle_pause())
         self._pause_item.set_sensitive(False)
         menu.append(self._pause_item)
 
@@ -1890,6 +2534,15 @@ class TrayIcon:
         settings_item.connect("activate", self._on_settings)
         menu.append(settings_item)
 
+        def open_history(_item):
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            HISTORY_FILE.touch()
+            subprocess.Popen(["xdg-open", str(HISTORY_FILE)])
+
+        history_item = Gtk.MenuItem(label="Dictation History")
+        history_item.connect("activate", open_history)
+        menu.append(history_item)
+
         menu.append(Gtk.SeparatorMenuItem())
 
         quit_item = Gtk.MenuItem(label="Quit")
@@ -1899,13 +2552,14 @@ class TrayIcon:
         menu.show_all()
         self._indicator.set_menu(menu)
 
-    def _on_switch_model(self, _item, model_id):
-        new_config = self._controller.config
-        new_config.model_profile = model_id
-        self._controller.apply_config(new_config)
-        self._hotkey_mgr.rebuild(new_config)
+    def refresh(self):
+        """Rebuild the menu and re-sync labels/icon after a model change."""
         self._build_menu()
         self.update_ui()
+
+    def _on_switch_model(self, _item, model_id):
+        self._controller.switch_model(model_id)
+        self.refresh()
 
     def _on_toggle(self, _item=None):
         self._controller.toggle()
@@ -1954,8 +2608,7 @@ class TrayIcon:
     def _apply_settings(self, new_config: AppConfig):
         self._controller.apply_config(new_config)
         self._hotkey_mgr.rebuild(new_config)
-        self._build_menu()
-        self.update_ui()
+        self.refresh()
 
     def _on_quit(self, _item):
         self._controller.stop()
@@ -1967,12 +2620,11 @@ class TrayIcon:
 # ---------------------------------------------------------------------------
 
 def main():
-    global _active_config
+    _migrate_legacy_models()
     config = AppConfig.load()
-    _active_config = config
 
-    # Ensure typer is a valid Wayland method
-    if config.typer not in ("clipboard", "wtype", "ydotool"):
+    # Ensure typer is a valid method
+    if config.typer not in ("xdotool", "clipboard", "wtype", "ydotool"):
         config.typer = "clipboard"
 
     controller = DictationController(config)
@@ -1985,13 +2637,13 @@ def main():
         on_toggle=lambda: (controller.toggle(), tray and tray.update_ui()),
         on_start=lambda: (controller.start(), tray and tray.update_ui()),
         on_stop=lambda: (controller.stop(), tray and tray.update_ui()),
-        on_pause=lambda: controller.pause(),
+        on_pause=lambda: controller.toggle_pause(),
     )
 
-    main_window = MainWindow(controller, hotkey_mgr)
+    main_window = MainWindow(controller)
 
     tray = TrayIcon(controller, hotkey_mgr, main_window)
-    main_window._tray = tray  # So model changes from window rebuild tray menu
+    main_window.tray_refresh = tray.refresh
     hotkey_mgr.start()
 
     signal.signal(signal.SIGINT, lambda *_: (controller.stop(), Gtk.main_quit()))
@@ -2002,8 +2654,7 @@ def main():
         def _on_model_ready(new_config):
             controller.apply_config(new_config)
             hotkey_mgr.rebuild(new_config)
-            tray._build_menu()
-            tray.update_ui()
+            tray.refresh()
         WelcomeDialog(profiles_data, config, _on_model_ready)
 
     profile_name = controller.profiles.get(

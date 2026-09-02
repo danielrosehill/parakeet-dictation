@@ -30,12 +30,51 @@
         }
       }
     },
+    "desktop-fp32": {
+      "name": "Parakeet TDT 0.6B v3 (fp32)",
+      "description": "Same model unquantized \u2014 cleanest wording. ~2432 MB download, ~2.6 GB RAM.",
+      "recommended_for": "Desktops with RAM to spare",
+      "hardware_label": "CPU",
+      "params": "600M",
+      "size_mb": 2432,
+      "streaming": false,
+      "feature_dim": 128,
+      "model_type": "nemo_transducer",
+      "decoder_type": "transducer",
+      "files": {
+        "encoder": {
+          "filename": "encoder.onnx",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3/resolve/main/encoder.onnx"
+        },
+        "encoder_weights": {
+          "filename": "encoder.weights",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3/resolve/main/encoder.weights"
+        },
+        "decoder": {
+          "filename": "decoder.onnx",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3/resolve/main/decoder.onnx"
+        },
+        "joiner": {
+          "filename": "joiner.onnx",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3/resolve/main/joiner.onnx"
+        },
+        "tokens": {
+          "filename": "tokens.txt",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3/resolve/main/tokens.txt"
+        }
+      }
+    },
     "laptop": {
       "name": "Canary 180M Flash (int8)",
       "description": "Lightweight, 4 languages (EN/ES/DE/FR). ~198 MB download, ~500 MB RAM.",
       "recommended_for": "Laptops and low-RAM machines",
       "hardware_label": "CPU",
-      "languages": ["en", "es", "de", "fr"],
+      "languages": [
+        "en",
+        "es",
+        "de",
+        "fr"
+      ],
       "params": "180M",
       "size_mb": 198,
       "streaming": false,
@@ -87,10 +126,17 @@
           "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemotron-speech-streaming-en-0.6b-int8-2026-01-14/resolve/main/tokens.txt"
         }
       }
+    },
+    "gemini-live": {
+      "name": "Gemini 3.5 Transcribe Live (cloud)",
+      "description": "Google's streaming speech-to-text over the network. Needs a Gemini API key (Settings > General) and internet; about $0.01/min. 85+ languages, auto-detected.",
+      "recommended_for": "Best accuracy when online",
+      "hardware_label": "Cloud",
+      "streaming": true,
+      "backend": "gemini",
+      "model_id": "gemini-3.5-transcribe-live",
+      "transcription_mode": "SMART",
+      "files": {}
     }
-  },
-  "vad": {
-    "filename": "silero_vad.onnx",
-    "url": "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx"
   }
 }
